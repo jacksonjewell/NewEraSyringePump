@@ -78,11 +78,44 @@ SYRINGE_PRESETS_MM = {
 
 RATE_UNITS = ["mL/min", "mL/hr", "uL/min", "uL/hr"]
 DISPENSE_MODES = ["Continuous", "Volume"]
+BAUD_RATES = ["9600", "19200"]
+STX = 0x02
+ETX = 0x03
 
 
 def detected_port_names() -> list[str]:
     ports = serial.tools.list_ports.comports()
     return sorted([p.device for p in ports])
+
+
+def probe_pump_address(com_name: str, address: int, baud_rate: int, timeout: float = 1.5) -> bool:
+    """Send a bare status query to the pump and check for a valid STX...ETX reply."""
+    conn = None
+    try:
+        conn = serial.Serial(port=com_name, baudrate=baud_rate, timeout=timeout)
+        conn.reset_input_buffer()
+        request = f"{address}\r".encode()
+        conn.write(request)
+        conn.flush()
+        first = conn.read(1)
+        if not first or first[0] != STX:
+            return False
+        buf = bytearray()
+        while True:
+            chunk = conn.read(1)
+            if not chunk:
+                return False
+            buf.extend(chunk)
+            if buf[-1] == ETX:
+                return True
+    except Exception:
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def to_ml_per_min(value: float, units: str) -> float:
@@ -128,6 +161,11 @@ class PumpPanel(ttk.LabelFrame):
         ttk.Label(self, text="Address").grid(row=0, column=2, sticky="w")
         self.address_var = tk.StringVar(value="0")
         ttk.Entry(self, textvariable=self.address_var, width=6).grid(row=0, column=3, sticky="w", padx=(6, 0))
+
+        ttk.Label(self, text="Baud Rate").grid(row=0, column=4, sticky="w", padx=(10, 0))
+        self.baud_var = tk.StringVar(value="19200")
+        ttk.Combobox(self, textvariable=self.baud_var, values=BAUD_RATES, state="readonly", width=8).grid(
+            row=0, column=5, sticky="w", padx=(6, 0))
 
         ttk.Label(self, text="Syringe").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.syringe_var = tk.StringVar(value="BD 10 mL (10 cc)")
@@ -191,18 +229,23 @@ class PumpPanel(ttk.LabelFrame):
 
         btn_row = ttk.Frame(self)
         btn_row.grid(row=6, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        for idx in range(7):
+        for idx in range(8):
             btn_row.columnconfigure(idx, weight=1)
         ttk.Button(btn_row, text="Connect", command=self.connect).grid(row=0, column=0, padx=4, sticky="ew")
         ttk.Button(btn_row, text="Disconnect", command=self.disconnect).grid(row=0, column=1, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Apply", command=lambda: self.app.apply_with_mode(self)).grid(row=0, column=2, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Run", command=lambda: self.app.run_with_mode(self)).grid(row=0, column=3, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Stop", command=lambda: self.app.stop_with_mode(self)).grid(row=0, column=4, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Read", command=self.read_status_async).grid(row=0, column=5, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Reset Volume", command=self.reset_volume_async).grid(row=0, column=6, padx=4, sticky="ew")
+        ttk.Button(btn_row, text="Reinitialize", command=self.reinitialize).grid(row=0, column=2, padx=4, sticky="ew")
+        ttk.Button(btn_row, text="Apply", command=lambda: self.app.apply_with_mode(self)).grid(row=0, column=3, padx=4, sticky="ew")
+        ttk.Button(btn_row, text="Run", command=lambda: self.app.run_with_mode(self)).grid(row=0, column=4, padx=4, sticky="ew")
+        ttk.Button(btn_row, text="Stop", command=lambda: self.app.stop_with_mode(self)).grid(row=0, column=5, padx=4, sticky="ew")
+        ttk.Button(btn_row, text="Read", command=self.read_status_async).grid(row=0, column=6, padx=4, sticky="ew")
+        ttk.Button(btn_row, text="Reset Volume", command=self.reset_volume_async).grid(row=0, column=7, padx=4, sticky="ew")
+
+        btn_row2 = ttk.Frame(self)
+        btn_row2.grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Button(btn_row2, text="Auto-detect Address", command=self.auto_detect_address).pack(side="left", padx=4)
 
         self.status_var = tk.StringVar(value="Not connected")
-        ttk.Label(self, textvariable=self.status_var).grid(row=7, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(self, textvariable=self.status_var).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
         self.columnconfigure(1, weight=1)
         self._on_syringe_preset_change()
 
@@ -239,17 +282,32 @@ class PumpPanel(ttk.LabelFrame):
         if value is not None:
             self.custom_diameter_var.set(f"{value:.2f}")
 
+    def _get_baud_rate(self) -> int:
+        return int(self.baud_var.get().strip())
+
     def connect(self) -> None:
         def work() -> None:
             com_name = self.com_var.get().strip()
             if not com_name:
                 raise ValueError("Enter a COM port (example: COM3).")
             address = self._get_address()
-            port = Port(com_name)
-            pump = Pump(port, address=address, model_number=1000)
-            self.connection.port = port
-            self.connection.pump = pump
-            self.after(0, lambda: self.set_status(f"Connected to {com_name} (addr {address})"))
+            baud_rate = self._get_baud_rate()
+            port = None
+            try:
+                port = Port(com_name, baud_rate=baud_rate)
+                pump = Pump(port, address=address, model_number=1000)
+                self.connection.port = port
+                self.connection.pump = pump
+                self.after(0, lambda: self.set_status(f"Connected to {com_name} (addr {address})"))
+            except Exception:
+                if port is not None:
+                    try:
+                        port.close()
+                    except Exception:
+                        pass
+                self.connection.port = None
+                self.connection.pump = None
+                raise
 
         self._run_in_thread(work)
 
@@ -258,6 +316,64 @@ class PumpPanel(ttk.LabelFrame):
             self.connection.close()
             self.run_start_ts = None
             self.after(0, lambda: self.set_status("Disconnected"))
+
+        self._run_in_thread(work)
+
+    def reinitialize(self) -> None:
+        def work() -> None:
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+            self.connection.port = None
+            self.connection.pump = None
+            self.run_start_ts = None
+            self._polling = False
+
+            def reset_ui() -> None:
+                self.set_status("Not connected")
+                self.dispensed_ul_var.set("0")
+                self.total_dispensed_ul_var.set("0")
+                self.time_sec_var.set("0")
+
+            self.after(0, reset_ui)
+
+        self._run_in_thread(work)
+
+    def auto_detect_address(self) -> None:
+        def work() -> None:
+            com_name = self.com_var.get().strip()
+            if not com_name:
+                self.after(0, lambda: self.set_status("Enter a COM port first."))
+                return
+            self.after(0, lambda: self.set_status("Scanning for pump (trying baud rates & addresses 0-9)..."))
+            for baud in [19200, 9600]:
+                for addr in range(10):
+                    self.after(0, lambda b=baud, a=addr: self.set_status(
+                        f"Trying baud {b}, address {a}..."))
+                    if probe_pump_address(com_name, addr, baud):
+                        port = None
+                        try:
+                            port = Port(com_name, baud_rate=baud)
+                            pump = Pump(port, address=addr, model_number=0)
+                            self.connection.port = port
+                            self.connection.pump = pump
+                            self.after(0, lambda a=addr: self.address_var.set(str(a)))
+                            self.after(0, lambda b=baud: self.baud_var.set(str(b)))
+                            self.after(0, lambda a=addr, b=baud: self.set_status(
+                                f"Found pump at address {a}, baud {b} on {com_name} — connected!"))
+                            return
+                        except Exception as exc:
+                            if port is not None:
+                                try:
+                                    port.close()
+                                except Exception:
+                                    pass
+                            self.after(0, lambda a=addr, b=baud, e=str(exc): self.set_status(
+                                f"Pump responded at addr {a} baud {b} but connect failed: {e}"))
+                            return
+            self.after(0, lambda: self.set_status(
+                "No pump found. Check cable, power, and that the pump is on."))
 
         self._run_in_thread(work)
 
@@ -302,10 +418,7 @@ class PumpPanel(ttk.LabelFrame):
 
     def run_sync(self) -> None:
         pump = self._require_pump()
-        if self.dispense_mode_var.get() == "Continuous":
-            pump.run_purge()
-        else:
-            pump.run(wait_while_running=False)
+        pump.run(wait_while_running=False)
         self.run_start_ts = time.time()
 
     def stop_sync(self) -> None:
