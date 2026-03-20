@@ -1,5 +1,5 @@
 """
-LabVIEW-style Tkinter GUI for controlling three New Era NE-1000 syringe pumps.
+Tkinter GUI for controlling three New Era NE-1000 syringe pumps and an Arduino vacuum.
 """
 
 from __future__ import annotations
@@ -16,8 +16,55 @@ import serial.tools.list_ports
 from nesp_lib import Port, Pump, PumpingDirection
 
 
+DARK = {
+    "bg": "#1E1E2E",
+    "panel": "#2A2A3C",
+    "input": "#353548",
+    "fg": "#E8E8F0",
+    "dim": "#9090A8",
+    "btn": "#3A3A50",
+    "btn_hover": "#2E2E42",
+    "btn_border": "#50506A",
+}
+LIGHT = {
+    "bg": "SystemButtonFace",
+    "panel": "SystemButtonFace",
+    "input": "white",
+    "fg": "black",
+    "dim": "#555555",
+    "btn": "#E0E0E0",
+    "btn_hover": "#C8C8C8",
+    "btn_border": "#AAAAAA",
+}
+
+
+def apply_theme(style: ttk.Style, theme: dict) -> None:
+    style.configure(".", background=theme["bg"], foreground=theme["fg"],
+                     fieldbackground=theme["input"], borderwidth=0)
+    style.configure("TFrame", background=theme["bg"])
+    style.configure("TLabel", background=theme["bg"], foreground=theme["fg"])
+    style.configure("TLabelFrame", background=theme["bg"], foreground=theme["fg"])
+    style.configure("TLabelFrame.Label", background=theme["bg"], foreground=theme["fg"])
+    style.configure("TEntry", fieldbackground=theme["input"], foreground=theme["fg"],
+                     insertcolor=theme["fg"])
+    style.configure("TCombobox", fieldbackground=theme["input"], foreground=theme["fg"],
+                     arrowcolor=theme["fg"])
+    style.map("TCombobox",
+              fieldbackground=[("readonly", theme["input"])],
+              foreground=[("readonly", theme["fg"])],
+              selectbackground=[("readonly", theme["input"])],
+              selectforeground=[("readonly", theme["fg"])])
+    style.configure("TButton", background=theme["btn"], foreground=theme["fg"],
+                     borderwidth=1, relief="solid", padding=(10, 6),
+                     bordercolor=theme["btn_border"],
+                     lightcolor=theme["btn_border"],
+                     darkcolor=theme["btn_border"])
+    style.map("TButton", background=[("active", theme["btn_hover"]),
+                                      ("pressed", theme["btn_hover"])])
+    style.configure("TCheckbutton", background=theme["bg"], foreground=theme["fg"])
+
+
 SYRINGE_PRESETS_MM = {
-    # Common BD syringe IDs used for pump setup (inner diameter in mm).
     "BD 1 mL": 4.78,
     "BD 3 mL": 8.66,
     "BD 5 mL (5 cc)": 12.06,
@@ -89,7 +136,7 @@ class PumpPanel(ttk.LabelFrame):
             textvariable=self.syringe_var,
             values=list(SYRINGE_PRESETS_MM.keys()),
             state="readonly",
-            width=12,
+            width=18,
         )
         self.syringe_combo.grid(row=1, column=1, sticky="w", padx=(6, 10), pady=(6, 0))
         self.syringe_combo.bind("<<ComboboxSelected>>", lambda _: self._on_syringe_preset_change())
@@ -130,16 +177,16 @@ class PumpPanel(ttk.LabelFrame):
             row=4, column=3, sticky="w", padx=(6, 0), pady=(6, 0)
         )
 
-        ttk.Label(self, text="Total Volume Dispensed (uL)").grid(row=5, column=2, sticky="w", pady=(6, 0))
-        self.total_dispensed_ul_var = tk.StringVar(value="0")
-        ttk.Entry(self, textvariable=self.total_dispensed_ul_var, width=10, state="readonly").grid(
-            row=5, column=3, sticky="w", padx=(6, 0), pady=(6, 0)
-        )
-
         ttk.Label(self, text="Time (sec)").grid(row=5, column=0, sticky="w", pady=(6, 0))
         self.time_sec_var = tk.StringVar(value="0")
         ttk.Entry(self, textvariable=self.time_sec_var, width=10, state="readonly").grid(
             row=5, column=1, sticky="w", padx=(6, 10), pady=(6, 0)
+        )
+
+        ttk.Label(self, text="Total Volume Dispensed (uL)").grid(row=5, column=2, sticky="w", pady=(6, 0))
+        self.total_dispensed_ul_var = tk.StringVar(value="0")
+        ttk.Entry(self, textvariable=self.total_dispensed_ul_var, width=10, state="readonly").grid(
+            row=5, column=3, sticky="w", padx=(6, 0), pady=(6, 0)
         )
 
         btn_row = ttk.Frame(self)
@@ -173,7 +220,8 @@ class PumpPanel(ttk.LabelFrame):
             try:
                 fn()
             except Exception as exc:
-                self.after(0, lambda: self.set_status(f"Error: {exc}"))
+                msg = str(exc)
+                self.after(0, lambda m=msg: self.set_status(f"Error: {m}"))
 
         threading.Thread(target=wrapped, daemon=True).start()
 
@@ -320,7 +368,7 @@ class PumpPanel(ttk.LabelFrame):
 
 
 class VacuumPanel(ttk.LabelFrame):
-    """Bottom-right vacuum control using an Arduino serial command (1/0)."""
+    """Vacuum control using an Arduino serial command (1/0)."""
 
     def __init__(self, master: tk.Widget, ports: list[str]) -> None:
         super().__init__(master, text="Vacuum Control", padding=10)
@@ -358,7 +406,12 @@ class VacuumPanel(ttk.LabelFrame):
         self.conn_status_var = tk.StringVar(value="Arduino: Disconnected")
         ttk.Label(self, textvariable=self.conn_status_var).grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
-        self.toggle_btn = tk.Button(self, text="Tap ON", command=self.toggle_vacuum, fg="white")
+        self.toggle_btn = tk.Button(
+            self, text="Tap ON", command=self.toggle_vacuum,
+            fg="white", bd=0, relief="flat",
+            font=("Segoe UI", 10, "bold"),
+            padx=10, pady=8, cursor="hand2",
+        )
         self.toggle_btn.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         self._set_button_color()
 
@@ -383,10 +436,8 @@ class VacuumPanel(ttk.LabelFrame):
 
     def _set_button_color(self) -> None:
         if self.is_on:
-            # ON state: red button indicates tapping will turn vacuum OFF.
             self.toggle_btn.configure(bg="#C0392B", activebackground="#A93226")
         else:
-            # OFF state: green button indicates tapping will turn vacuum ON.
             self.toggle_btn.configure(bg="#1E8449", activebackground="#196F3D")
 
     def _set_reply(self, text: str) -> None:
@@ -446,7 +497,6 @@ class VacuumPanel(ttk.LabelFrame):
 
         def work() -> None:
             try:
-                # Give Arduino a brief moment to print response line.
                 time.sleep(0.08)
                 line = conn.readline().decode("utf-8", errors="ignore").strip()
                 if line:
@@ -460,7 +510,6 @@ class VacuumPanel(ttk.LabelFrame):
         def work() -> None:
             conn = self._ensure_connected()
             self._wait_until_ready()
-            # Clear stale startup bytes from auto-reset so first toggle is reliable.
             if conn.in_waiting:
                 _ = conn.read(conn.in_waiting)
             self.after(0, lambda: self._set_status("Arduino connected and ready"))
@@ -495,14 +544,14 @@ class VacuumPanel(ttk.LabelFrame):
                     self.after(0, self._set_button_color)
                     self.after(0, lambda: self._set_status("Vacuum ON (sent 1)"))
             except Exception as exc:
-                self.after(0, lambda: self._set_status(f"Error: {exc}"))
+                msg = str(exc)
+                self.after(0, lambda m=msg: self._set_status(f"Error: {m}"))
 
         threading.Thread(target=work, daemon=True).start()
 
     def force_off(self) -> None:
         def work() -> None:
             try:
-                # Send OFF only if currently on; still keep this idempotent for safety.
                 if self.is_on:
                     self._send_value("0")
                 self.is_on = False
@@ -510,7 +559,8 @@ class VacuumPanel(ttk.LabelFrame):
                 self.after(0, self._set_button_color)
                 self.after(0, lambda: self._set_status("Vacuum OFF (forced)"))
             except Exception as exc:
-                self.after(0, lambda: self._set_status(f"Error forcing OFF: {exc}"))
+                msg = str(exc)
+                self.after(0, lambda m=msg: self._set_status(f"Error forcing OFF: {m}"))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -527,8 +577,11 @@ class PumpControllerApp(tk.Tk):
 
         self.mode_var = tk.StringVar(value="Individual mode")
         self.switch_together_var = tk.BooleanVar(value=False)
+        self.dark_mode = False
         self.panels: list[PumpPanel] = []
         self.vacuum_panel: Optional[VacuumPanel] = None
+        self._style = ttk.Style(self)
+        self._style.theme_use("clam")
         self._build()
         self._schedule_live_updates()
 
@@ -545,6 +598,8 @@ class PumpControllerApp(tk.Tk):
         ).pack(side="left", padx=(6, 16))
         ttk.Checkbutton(header, text="Switch Together", variable=self.switch_together_var).pack(side="left")
         ttk.Button(header, text="Refresh COM Ports", command=self.refresh_ports).pack(side="left", padx=(16, 0))
+        self.dark_mode_btn = ttk.Button(header, text="Dark Mode", command=self.toggle_dark_mode)
+        self.dark_mode_btn.pack(side="left", padx=(16, 0))
         ttk.Button(header, text="Power Off (Stop All)", command=self.power_off).pack(side="right")
 
         body = ttk.Frame(self, padding=(12, 0, 12, 12))
@@ -613,8 +668,9 @@ class PumpControllerApp(tk.Tk):
         try:
             work()
         except Exception as exc:
+            msg = str(exc)
             for panel in targets:
-                panel.after(0, lambda p=panel: p.set_status(f"Error: {exc}"))
+                panel.after(0, lambda p=panel, m=msg: p.set_status(f"Error: {m}"))
 
     def apply_with_mode(self, source_panel: PumpPanel) -> None:
         self._run_group_action(source_panel, "apply")
@@ -649,6 +705,13 @@ class PumpControllerApp(tk.Tk):
                 self.vacuum_panel.force_off()
 
         threading.Thread(target=work, daemon=True).start()
+
+    def toggle_dark_mode(self) -> None:
+        self.dark_mode = not self.dark_mode
+        theme = DARK if self.dark_mode else LIGHT
+        apply_theme(self._style, theme)
+        self.configure(bg=theme["bg"])
+        self.dark_mode_btn.configure(text="Light Mode" if self.dark_mode else "Dark Mode")
 
     def _schedule_live_updates(self) -> None:
         for panel in self.panels:
