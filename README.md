@@ -2,7 +2,7 @@
 
 A Python/Tkinter GUI for controlling up to three **New Era NE-1000** syringe pumps and an **Arduino-driven vacuum pump** from a single interface.
 
-Built for the Wanunu Lab at Duquesne University.
+Built for the Wanunu Lab at Northeastern University.
 
 ## Features
 
