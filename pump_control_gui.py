@@ -163,6 +163,7 @@ class PumpPanel(ttk.LabelFrame):
         ttk.Entry(self, textvariable=self.address_var, width=6).grid(row=0, column=3, sticky="w", padx=(6, 0))
 
         ttk.Label(self, text="Baud Rate").grid(row=0, column=4, sticky="w", padx=(10, 0))
+        # NE-1000 pumps often ship at 19200; NESP-Lib Port defaults to 9600 — pick what matches your pump menu.
         self.baud_var = tk.StringVar(value="19200")
         ttk.Combobox(self, textvariable=self.baud_var, values=BAUD_RATES, state="readonly", width=8).grid(
             row=0, column=5, sticky="w", padx=(6, 0))
@@ -242,7 +243,7 @@ class PumpPanel(ttk.LabelFrame):
 
         btn_row2 = ttk.Frame(self)
         btn_row2.grid(row=7, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Button(btn_row2, text="Auto-detect Address", command=self.auto_detect_address).pack(side="left", padx=4)
+        ttk.Button(btn_row2, text="Pump Auto-Connect", command=self.auto_connect_pump).pack(side="left", padx=4)
 
         self.status_var = tk.StringVar(value="Not connected")
         ttk.Label(self, textvariable=self.status_var).grid(row=8, column=0, columnspan=4, sticky="w", pady=(8, 0))
@@ -340,13 +341,14 @@ class PumpPanel(ttk.LabelFrame):
 
         self._run_in_thread(work)
 
-    def auto_detect_address(self) -> None:
+    def auto_connect_pump(self) -> None:
+        """Pump Auto-Connect: use selected COM port; scan baud + address 0–9, then open connection when found."""
         def work() -> None:
             com_name = self.com_var.get().strip()
             if not com_name:
-                self.after(0, lambda: self.set_status("Enter a COM port first."))
+                self.after(0, lambda: self.set_status("Enter a COM port, then use Pump Auto-Connect."))
                 return
-            self.after(0, lambda: self.set_status("Scanning for pump (trying baud rates & addresses 0-9)..."))
+            self.after(0, lambda: self.set_status("Pump Auto-Connect: scanning baud rates and addresses 0–9..."))
             for baud in [19200, 9600]:
                 for addr in range(10):
                     self.after(0, lambda b=baud, a=addr: self.set_status(
