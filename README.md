@@ -103,7 +103,9 @@ The committed file **`recipes.example.json`** contains two recipes: one **withou
 
 ## Arduino Vacuum Sketch
 
-Flash `VacuumPumpV1.ino` to an Arduino Uno. The sketch listens at 9600 baud and accepts:
+The sketch is in the repo at **`arduino/VacuumPumpV1/VacuumPumpV1.ino`** (Arduino IDE expects the folder name to match the `.ino` filename). Open that folder in Arduino IDE and upload to an Uno.
+
+The sketch listens at **9600** baud and accepts:
 
 - `1` — motor + LED ON
 - `0` — motor + LED OFF
@@ -113,13 +115,14 @@ The GUI's Vacuum Control panel connects to the Arduino's COM port and sends thes
 ## Project Structure
 
 ```
-pump_control_gui.py         Main GUI application
-pump_environment_check.py   Quick hardware/environment readiness check
-recipes.example.json        Example recipes + sequence steps (documented format; copy to recipes.json)
-recipes.json                Your saved recipes (created by the app; listed in .gitignore)
-pump_labels.json            Your pump nicknames (auto-saved; listed in .gitignore)
-requirements.txt            Python dependencies (NESP-Lib, pyserial)
-.gitignore                  Excludes venv, cache, IDE files, and local JSON data
+pump_control_gui.py              Main GUI application
+pump_environment_check.py        Quick hardware/environment readiness check
+arduino/VacuumPumpV1/            Arduino vacuum sketch (VacuumPumpV1.ino)
+recipes.example.json             Example recipes + sequence steps (documented format; copy to recipes.json)
+recipes.json                     Your saved recipes (created by the app; listed in .gitignore)
+pump_labels.json                 Your pump nicknames (auto-saved; listed in .gitignore)
+requirements.txt                 Python dependencies (NESP-Lib, pyserial)
+.gitignore                       Excludes venv, cache, IDE files, and local JSON data
 ```
 
 ## Dependencies
