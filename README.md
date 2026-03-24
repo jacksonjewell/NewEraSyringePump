@@ -50,8 +50,56 @@ If Windows blocks the script, call the interpreter explicitly (as above) or run 
 |------|---------|
 | `recipes.json` | Saved recipes and sequences (created by the app; **gitignored** — contains COM ports and lab-specific settings). |
 | `pump_labels.json` | Pump display names (auto-saved; **gitignored**). |
+| **`recipes.example.json`** | **Checked into the repo** — full example of the file format (see below). Copy/rename to `recipes.json` to try it, then edit COM ports to match your PC. |
 
-To start from an empty recipe list in a new clone, copy `recipes.example.json` to `recipes.json` or save a recipe once from **Recipes…**.
+### `recipes.json` format (and `recipes.example.json`)
+
+The GUI reads/writes a single JSON file with this top-level shape:
+
+```json
+{
+  "version": 1,
+  "recipes": [ /* array of recipe objects */ ]
+}
+```
+
+Each **recipe** object usually includes:
+
+| Field | Description |
+|-------|-------------|
+| `id` | Unique string (UUID). Required for **Edit sequence…** to save steps back to the same recipe. |
+| `name` | Display name in the Recipes window and main toolbar drop-down. |
+| `pump1`, `pump2`, `pump3` | Syringe/rate/dispense/direction snapshots (same keys as the pump panels). |
+| `pump1_conn`, `pump2_conn`, `pump3_conn` | `com` (string), `baud` (int, typically **19200** for NE-1000), `address` (int). |
+| `pump_labels` | Optional map `"1"` / `"2"` / `"3"` → display name strings. |
+| `steps` | Optional list of sequence steps. If **missing or empty**, **Run recipe** / **Apply + Run all** only applies panel settings and runs connected pumps. If **non-empty**, **Run recipe** runs this sequence in order. |
+
+**`pump1` / `pump2` / `pump3` fields** (strings unless noted):
+
+- `syringe` — preset name from the GUI (e.g. `"BD 10 mL (10 cc)"`) or `"Custom"`.
+- `custom_diameter_mm` — inner diameter in mm.
+- `rate_units` — one of `mL/min`, `mL/hr`, `uL/min`, `uL/hr`.
+- `rate_value` — numeric string.
+- `dispense_mode` — `Continuous` or `Volume`.
+- `volume_ul` — µL to dispense when mode is `Volume`.
+- `direction` — `Infuse` or `Withdraw`.
+
+**Sequence `steps`** — each element is an object with `type` and type-specific fields. Optional `label` (or legacy `step_label`) adds text in the sequence list.
+
+| `type` | Extra fields |
+|--------|----------------|
+| `delay` | `seconds` (number) |
+| `connect_pump` | `pump` (1–3), `com`, `baud`, `address` |
+| `disconnect_pump` | `pump` (1–3) |
+| `apply_pump` | `pump` (1–3), `settings` (same shape as `pump1` / `pump2` / `pump3` above) |
+| `run_pump` | `pump` (1–3) |
+| `stop_pump` | `pump` (1–3) |
+| `vacuum_connect` | `com`, `baud` (Arduino; often **9600**) |
+| `vacuum_disconnect` | *(none)* |
+| `vacuum_on` | *(none)* — sends `1` |
+| `vacuum_off` | *(none)* — sends `0` |
+
+The committed file **`recipes.example.json`** contains two recipes: one **without** `steps` (toolbar **Run recipe** behaves like apply + run), and one **with** a sample `steps` array you can trim or copy from.
 
 ## Arduino Vacuum Sketch
 
@@ -67,7 +115,7 @@ The GUI's Vacuum Control panel connects to the Arduino's COM port and sends thes
 ```
 pump_control_gui.py         Main GUI application
 pump_environment_check.py   Quick hardware/environment readiness check
-recipes.example.json        Example empty recipe store (copy to recipes.json locally)
+recipes.example.json        Example recipes + sequence steps (documented format; copy to recipes.json)
 recipes.json                Your saved recipes (created by the app; listed in .gitignore)
 pump_labels.json            Your pump nicknames (auto-saved; listed in .gitignore)
 requirements.txt            Python dependencies (NESP-Lib, pyserial)
