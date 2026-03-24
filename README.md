@@ -69,9 +69,11 @@ If Windows blocks the script, call the interpreter explicitly (as above) or run 
 
 | File | Purpose |
 |------|---------|
-| `recipes.json` | Saved recipes and sequences (created by the app; **gitignored** — contains COM ports and lab-specific settings). |
-| `pump_labels.json` | Pump display names (auto-saved; **gitignored**). |
-| **`recipes.example.json`** | **Checked into the repo** — full example of the file format (see below). Copy/rename to `recipes.json` to try it, then edit COM ports to match your PC. |
+| `recipes.json` | Saved recipes and sequences. **Committed to this repo** so you can `git pull` the same recipes on another computer. Contains **COM port names** (e.g. `COM3`); laptop vs desktop often need different ports — edit after pull if hardware differs. |
+| `pump_labels.json` | Pump display names (auto-saved). **Committed** with the repo for the same reason. |
+| **`recipes.example.json`** | Reference / template for the JSON shape (see below). |
+
+**After you change recipes or nicknames in the GUI**, run **`.\push_recipes.ps1`** (or `git add` / `commit` / `push` those two files yourself) so the other machine gets updates. The app does not auto-push to GitHub.
 
 ### `recipes.json` format (and `recipes.example.json`)
 
@@ -139,11 +141,12 @@ The GUI's Vacuum Control panel connects to the Arduino's COM port and sends thes
 pump_control_gui.py              Main GUI application
 pump_environment_check.py        Quick hardware/environment readiness check
 arduino/VacuumPumpV1/            Arduino vacuum sketch (VacuumPumpV1.ino)
-recipes.example.json             Example recipes + sequence steps (documented format; copy to recipes.json)
-recipes.json                     Your saved recipes (created by the app; listed in .gitignore)
-pump_labels.json                 Your pump nicknames (auto-saved; listed in .gitignore)
+recipes.example.json             Reference example of the JSON format
+recipes.json                     Saved recipes (tracked in git for multi-PC sync)
+pump_labels.json                 Pump nicknames (tracked in git)
+push_recipes.ps1                 Commit + push recipes.json and pump_labels.json only
 requirements.txt                 Python dependencies (NESP-Lib, pyserial)
-.gitignore                       Excludes venv, cache, IDE files, and local JSON data
+.gitignore                       Excludes venv, cache, IDE files, logs
 ```
 
 ## Dependencies

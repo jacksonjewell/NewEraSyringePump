@@ -1,0 +1,168 @@
+{
+  "version": 1,
+  "recipes": [
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "name": "Example — settings only (no sequence)",
+      "pump_labels": {
+        "1": "Sample pump A",
+        "2": "",
+        "3": ""
+      },
+      "pump1_conn": {
+        "com": "COM3",
+        "baud": 19200,
+        "address": 0
+      },
+      "pump2_conn": {
+        "com": "COM4",
+        "baud": 19200,
+        "address": 1
+      },
+      "pump3_conn": {
+        "com": "COM5",
+        "baud": 19200,
+        "address": 2
+      },
+      "pump1": {
+        "syringe": "BD 10 mL (10 cc)",
+        "custom_diameter_mm": "14.50",
+        "rate_units": "mL/min",
+        "rate_value": "0.5",
+        "dispense_mode": "Continuous",
+        "volume_ul": "0",
+        "direction": "Infuse"
+      },
+      "pump2": {
+        "syringe": "BD 10 mL (10 cc)",
+        "custom_diameter_mm": "14.50",
+        "rate_units": "uL/min",
+        "rate_value": "100",
+        "dispense_mode": "Volume",
+        "volume_ul": "500",
+        "direction": "Withdraw"
+      },
+      "pump3": {
+        "syringe": "BD 20 mL (20 cc)",
+        "custom_diameter_mm": "19.05",
+        "rate_units": "mL/hr",
+        "rate_value": "1.0",
+        "dispense_mode": "Continuous",
+        "volume_ul": "0",
+        "direction": "Infuse"
+      }
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "name": "Example — with sequence",
+      "pump_labels": {
+        "1": "",
+        "2": "",
+        "3": ""
+      },
+      "pump1_conn": {
+        "com": "COM3",
+        "baud": 19200,
+        "address": 0
+      },
+      "pump2_conn": {
+        "com": "COM4",
+        "baud": 19200,
+        "address": 0
+      },
+      "pump3_conn": {
+        "com": "COM5",
+        "baud": 19200,
+        "address": 0
+      },
+      "pump1": {
+        "syringe": "BD 10 mL (10 cc)",
+        "custom_diameter_mm": "14.50",
+        "rate_units": "mL/min",
+        "rate_value": "0.1",
+        "dispense_mode": "Continuous",
+        "volume_ul": "0",
+        "direction": "Infuse"
+      },
+      "pump2": {
+        "syringe": "BD 10 mL (10 cc)",
+        "custom_diameter_mm": "14.50",
+        "rate_units": "mL/min",
+        "rate_value": "0.1",
+        "dispense_mode": "Continuous",
+        "volume_ul": "0",
+        "direction": "Infuse"
+      },
+      "pump3": {
+        "syringe": "BD 10 mL (10 cc)",
+        "custom_diameter_mm": "14.50",
+        "rate_units": "mL/min",
+        "rate_value": "0.1",
+        "dispense_mode": "Continuous",
+        "volume_ul": "0",
+        "direction": "Infuse"
+      },
+      "steps": [
+        {
+          "type": "delay",
+          "seconds": 1.0,
+          "label": "optional note in the list"
+        },
+        {
+          "type": "connect_pump",
+          "pump": 1,
+          "com": "COM3",
+          "baud": 19200,
+          "address": 0
+        },
+        {
+          "type": "apply_pump",
+          "pump": 1,
+          "settings": {
+            "syringe": "BD 10 mL (10 cc)",
+            "custom_diameter_mm": "14.50",
+            "rate_units": "mL/min",
+            "rate_value": "0.2",
+            "dispense_mode": "Volume",
+            "volume_ul": "100",
+            "direction": "Infuse"
+          }
+        },
+        {
+          "type": "run_pump",
+          "pump": 1
+        },
+        {
+          "type": "delay",
+          "seconds": 2.0
+        },
+        {
+          "type": "stop_pump",
+          "pump": 1
+        },
+        {
+          "type": "vacuum_connect",
+          "com": "COM6",
+          "baud": 9600
+        },
+        {
+          "type": "vacuum_on"
+        },
+        {
+          "type": "delay",
+          "seconds": 0.5
+        },
+        {
+          "type": "vacuum_off"
+        },
+        {
+          "type": "vacuum_disconnect"
+        },
+        {
+          "type": "disconnect_pump",
+          "pump": 1
+        }
+      ]
+    }
+  ]
+}

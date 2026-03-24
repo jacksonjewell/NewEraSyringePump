@@ -7,6 +7,5 @@ __pycache__/
 .cursor/
 *.log
 
-# Local machine-specific data (COM ports, saved recipes, display names)
-recipes.json
-pump_labels.json
+# recipes.json and pump_labels.json are tracked so laptop/desktop stay in sync via git pull/push.
+# (They contain COM port names — use a private repo if that matters.)
