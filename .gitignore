@@ -6,3 +6,7 @@ __pycache__/
 .vscode/
 .cursor/
 *.log
+
+# Local machine-specific data (COM ports, saved recipes, display names)
+recipes.json
+pump_labels.json
