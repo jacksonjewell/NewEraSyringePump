@@ -28,13 +28,30 @@ Built for the Wanunu Lab at Northeastern University.
 
 ## Setup
 
+After cloning, create a virtual environment and install dependencies. On Windows, **`py -3`** is recommended so the venv uses whatever Python 3 you have installed (avoids a broken `.venv` if you uninstall or move an old Python).
+
 ```powershell
 git clone https://github.com/jacksonjewell/NewEraSyringePump.git
 cd NewEraSyringePump
-python -m venv .venv
+py -3 -m venv .venv
 .\.venv\Scripts\python -m pip install --upgrade pip
 .\.venv\Scripts\python -m pip install -r requirements.txt
 ```
+
+On macOS/Linux you can use `python3 -m venv .venv` instead of `py -3 -m venv .venv`.
+
+### If `.venv` is broken (“No Python at …”, exit code 103)
+
+The folder `.venv` is **not** in git — it was created on your machine and points at a specific Python path. If that Python was removed or moved, delete and recreate:
+
+```powershell
+Remove-Item -Recurse -Force .venv
+py -3 -m venv .venv
+.\.venv\Scripts\python -m pip install --upgrade pip
+.\.venv\Scripts\python -m pip install -r requirements.txt
+```
+
+Each new computer (or fresh clone) should run the same `py -3 -m venv` + `pip install` steps once.
 
 ## Run
 
