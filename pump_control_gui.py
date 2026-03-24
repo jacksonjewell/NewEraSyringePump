@@ -405,7 +405,7 @@ class PumpPanel(ttk.LabelFrame):
         btn_row.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(10, 0))
         for idx in range(8):
             btn_row.columnconfigure(idx, weight=1)
-        ttk.Button(btn_row, text="Connect", command=self.connect).grid(row=0, column=0, padx=4, sticky="ew")
+        ttk.Button(btn_row, text="Manual Connect", command=self.connect).grid(row=0, column=0, padx=4, sticky="ew")
         ttk.Button(btn_row, text="Disconnect", command=self.disconnect).grid(row=0, column=1, padx=4, sticky="ew")
         ttk.Button(btn_row, text="Reinitialize", command=self.reinitialize).grid(row=0, column=2, padx=4, sticky="ew")
         ttk.Button(btn_row, text="Apply", command=lambda: self.app.apply_with_mode(self)).grid(row=0, column=3, padx=4, sticky="ew")
