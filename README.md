@@ -149,6 +149,4 @@ requirements.txt                 Python dependencies (NESP-Lib, pyserial)
 
 ## License
 
-This project is licensed under the [BSD 2-Clause License](LICENSE) — see `LICENSE` in the repository root.
-
-Third-party libraries (e.g. NESP-Lib, pyserial) remain under their respective licenses.
+Internal lab use.
