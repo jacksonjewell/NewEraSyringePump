@@ -9,15 +9,19 @@ Built for the Wanunu Lab at Northeastern University.
 - **3 independent pump panels** with per-pump COM port and address configuration
 - **BD syringe presets** (1 mL through 60 mL) with custom diameter support
 - **Rate units**: mL/min, mL/hr, uL/min, uL/hr
-- **Dispense modes**: Continuous or Volume-based (volume to dispense is shown only in **Volume** mode on each pump panel and in **Apply pump** sequence steps)
+- **Dispense modes**: Continuous or Volume-based. In **Volume** mode, the volume-to-dispense entry and a **unit selector** (uL, mL, L) appear to the right of the Dispense Mode dropdown.
 - **Direction**: Infuse / Withdraw
-- **Live status**: volume dispensed, total volume, elapsed time
+- **Live status**: volume dispensed, total volume, elapsed time — updated automatically via ~1 s polling
+- **Volume display units**: each pump panel has a **Display as** dropdown (uL, mL, L) for Volume Dispensed and Total Volume Dispensed readouts
 - **Mode selector**: Individual, Dual, or Triple mode with "Switch Together" toggle
-- **Power Off (Stop All)**: emergency stop for all pumps + vacuum
+- **Power Off (Stop All)**: red/yellow emergency stop button for all pumps + vacuum
 - **Dark / Light mode** toggle
-- **Arduino vacuum panel**: connect to Arduino Uno, toggle vacuum ON/OFF via serial (sends `1`/`0`), displays Arduino reply (`Motor ON`/`Motor OFF`)
+- **Styled action buttons**: **Pump Auto-Connect** and **Apply Settings** (yellow) share a row; **Run** (green) and **Stop** (red) share a row below. All action buttons illuminate on hover.
+- **Arduino vacuum panel**: connect to Arduino Uno, toggle vacuum ON/OFF via serial (sends `1`/`0`), displays Arduino reply. Toggle button is **orange when OFF** and **blinking blue when ON**.
 - **Manual COM port entry**: develop and configure without hardware connected
-- **Main toolbar recipes**: **Recipe** drop-down lists all saved recipes; **Run recipe** runs the selected one (sequence if it has steps, otherwise **Apply + Run all**). While running, **Run recipe** blinks red; **Abort recipe** stops between steps and during delays (a step already in progress may finish first).
+- **Recipe confirmation**: before running, a summary dialog shows pumps used, vacuum requirement, step list, and estimated run time. A **preflight check** verifies all hardware is connected; if not, a detailed error explains what's missing with suggestions to fix it.
+- **Progress bar**: during recipe execution, a progress bar in the bottom-right shows estimated completion percentage and time remaining.
+- **Main toolbar recipes**: **Recipe** drop-down lists all saved recipes; **Run recipe** shows the confirmation dialog, then runs the selected recipe (sequence if it has steps, otherwise **Apply + Run all**). While running, **Run recipe** blinks red; **Abort recipe** stops between steps and during delays (a step already in progress may finish first). A completion popup appears only on successful finish — not on errors or aborts.
 - **Recipes** (floating window via **Recipes…**): save syringe/rate/volume/direction **and** COM/baud/address for pumps 1–3; **Apply to pump panels** loads those fields. **Edit sequence…** opens a larger **Sequence** window to add ordered steps: delays, pump connect/disconnect/apply/run/stop, vacuum connect/disconnect/on/off. Reorder steps by **dragging** a row in the list or with **Move up / down**. **Edit step…** or **double-click** a row to change that step (same dialogs as when adding; vacuum ON/OFF/disconnect have no extra fields). Optional **Step label…** / **Clear step label** annotate each step in the list. **Run sequence** executes steps in order. Simple recipes without steps still use **Apply + Run all**. Data is stored in `recipes.json` next to the script.
 - **Pump display names**: each pump panel has a **Display name** field; the group title becomes `Pump N — Your name`. Names are saved to `pump_labels.json` and are also stored on **Save from main window** (as `pump_labels` in the recipe) and restored with **Apply to pump panels**.
 
