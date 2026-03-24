@@ -41,6 +41,50 @@ LIGHT = {
     "btn_border": "#AAAAAA",
 }
 
+BTN_POWER_OFF_ABORT = {
+    "bg": "#B91C1C",
+    "fg": "#FFEB3B",
+    "activebackground": "#7F1D1D",
+    "activeforeground": "#FFEB3B",
+    "font": ("Segoe UI", 9, "bold"),
+}
+BTN_APPLY_ACCENT = {
+    "bg": "#F5C518",
+    "fg": "#1a1a1a",
+    "activebackground": "#E0AF00",
+    "activeforeground": "#000000",
+    "font": ("Segoe UI", 9, "bold"),
+}
+
+
+def _resolve_color_to_hex(widget: tk.Widget, color: str) -> str:
+    """Convert any Tk colour name/system colour to a '#RRGGBB' hex string."""
+    if color.startswith("#") and len(color) == 7:
+        return color
+    try:
+        rgb = widget.winfo_rgb(color)
+        return f"#{rgb[0] >> 8:02X}{rgb[1] >> 8:02X}{rgb[2] >> 8:02X}"
+    except Exception:
+        return "#D0D0D0"
+
+
+def _brighten_hex(color: str, amount: int = 35) -> str:
+    """Lighten a hex colour by *amount* (0-255) per channel, clamping at 255."""
+    color = color.lstrip("#")
+    r, g, b = int(color[:2], 16), int(color[2:4], 16), int(color[4:6], 16)
+    r = min(255, r + amount)
+    g = min(255, g + amount)
+    b = min(255, b + amount)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def add_hover_glow(btn: tk.Button, normal_bg: Optional[str] = None) -> None:
+    """Bind <Enter>/<Leave> so the button brightens on hover, like ttk buttons."""
+    base = _resolve_color_to_hex(btn, normal_bg or btn.cget("bg"))
+    hover = _brighten_hex(base, 40)
+    btn.bind("<Enter>", lambda _e: btn.configure(bg=hover), add=True)
+    btn.bind("<Leave>", lambda _e: btn.configure(bg=base), add=True)
+
 
 def apply_theme(style: ttk.Style, theme: dict) -> None:
     style.configure(".", background=theme["bg"], foreground=theme["fg"],
@@ -236,6 +280,191 @@ def format_step_list_line(index: int, step: dict[str, Any], nicknames: Optional[
     return f"{index + 1}. {body}"
 
 
+def _estimate_step_seconds(step: dict[str, Any]) -> float:
+    """Best-effort estimate of how long a single recipe step takes (seconds)."""
+    t = step.get("type", "")
+    if t == "delay":
+        return max(0.0, float(step.get("seconds", 0)))
+    if t == "apply_pump":
+        s = step.get("settings") if isinstance(step.get("settings"), dict) else {}
+        if s.get("dispense_mode") == "Volume":
+            try:
+                vol_ul = float(s.get("volume_ul", 0))
+                rate_val = float(s.get("rate_value", 0))
+                rate_units = s.get("rate_units", "mL/min")
+                ml_per_min = to_ml_per_min(rate_val, rate_units)
+                if ml_per_min > 0 and vol_ul > 0:
+                    vol_ml = vol_ul / 1000.0
+                    return (vol_ml / ml_per_min) * 60.0
+            except (ValueError, ZeroDivisionError):
+                pass
+    return 0.0
+
+
+def _estimate_recipe_time(recipe: dict[str, Any]) -> float:
+    """Return total estimated seconds for a recipe (sequence or simple)."""
+    steps = recipe.get("steps")
+    if isinstance(steps, list) and steps:
+        return sum(_estimate_step_seconds(s) for s in steps if isinstance(s, dict))
+    return 0.0
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds <= 0:
+        return "< 1 s (instant / unknown)"
+    s = int(seconds)
+    if s < 60:
+        return f"{s} s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m} min {s:02d} s"
+    h, m = divmod(m, 60)
+    return f"{h} h {m:02d} min {s:02d} s"
+
+
+def _recipe_resources(recipe: dict[str, Any]) -> tuple[set[int], bool]:
+    """Return (set of pump numbers used, vacuum_needed) from recipe steps."""
+    pumps_used: set[int] = set()
+    vacuum_needed = False
+    steps = recipe.get("steps")
+    if isinstance(steps, list):
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            t = step.get("type", "")
+            if t in ("connect_pump", "disconnect_pump", "apply_pump", "run_pump", "stop_pump"):
+                try:
+                    pumps_used.add(int(step["pump"]))
+                except (KeyError, ValueError, TypeError):
+                    pass
+            elif t in ("vacuum_connect", "vacuum_disconnect", "vacuum_on", "vacuum_off"):
+                vacuum_needed = True
+    else:
+        for i in range(1, 4):
+            data = recipe.get(f"pump{i}")
+            if isinstance(data, dict):
+                pumps_used.add(i)
+    return pumps_used, vacuum_needed
+
+
+def _friendly_step_error(step: dict[str, Any], step_index: int, error_msg: str, nicknames: Optional[dict[int, str]] = None) -> str:
+    """Build a user-friendly error message with a suggestion for a failed recipe step."""
+    t = step.get("type", "?")
+    step_desc = format_step_summary(step, nicknames)
+    lines = [
+        f"Step {step_index + 1} failed: {step_desc}",
+        "",
+        f"Error: {error_msg}",
+        "",
+        "Suggestion:",
+    ]
+    low = error_msg.lower()
+    if t in ("connect_pump", "apply_pump", "run_pump", "stop_pump"):
+        pnum = step.get("pump", "?")
+        if "could not open port" in low or "denied" in low or "filenotfounderror" in low:
+            lines.append(f"  - Check that pump {pnum}'s USB cable is plugged in and the COM port is correct.")
+            lines.append(f"  - Make sure no other program is using the port.")
+        elif "not connected" in low or "no pump" in low or "nonetype" in low:
+            lines.append(f"  - Pump {pnum} is not connected. Add a 'Connect pump' step before this step,")
+            lines.append(f"    or manually connect pump {pnum} before running the recipe.")
+        elif "timeout" in low:
+            lines.append(f"  - Pump {pnum} did not respond. Check power, baud rate, and address settings.")
+        else:
+            lines.append(f"  - Verify pump {pnum} is powered on, connected, and settings are correct.")
+    elif t in ("vacuum_connect", "vacuum_on", "vacuum_off"):
+        if "could not open port" in low or "denied" in low or "filenotfounderror" in low:
+            lines.append("  - Check the Arduino USB cable and COM port assignment.")
+            lines.append("  - Make sure no other program is using the port.")
+        elif "not available" in low or "not connected" in low:
+            lines.append("  - The vacuum Arduino is not connected. Add a 'Vacuum connect' step,")
+            lines.append("    or connect it manually before running.")
+        else:
+            lines.append("  - Verify the Arduino is powered and the COM port / baud rate are correct.")
+    elif t == "delay":
+        lines.append("  - Check that the delay value is a valid number of seconds.")
+    else:
+        lines.append("  - Review this step's settings in the sequence editor.")
+    return "\n".join(lines)
+
+
+_POPUP_ICONS = {
+    "info": "\u2139\uFE0F",
+    "success": "\u2705",
+    "warning": "\u26A0\uFE0F",
+    "error": "\u274C",
+}
+_POPUP_ACCENT = {
+    "info": "#3B82F6",
+    "success": "#28A745",
+    "warning": "#E67E22",
+    "error": "#DC3545",
+}
+
+
+def show_popup(
+    parent: tk.Widget,
+    title: str,
+    message: str,
+    level: str = "info",
+    detail: str = "",
+    dark_mode: bool = False,
+) -> None:
+    """Show a themed, modern popup dialog."""
+    theme = DARK if dark_mode else LIGHT
+    accent = _POPUP_ACCENT.get(level, _POPUP_ACCENT["info"])
+    icon_char = _POPUP_ICONS.get(level, _POPUP_ICONS["info"])
+
+    d = tk.Toplevel(parent)
+    d.title(title)
+    d.transient(parent)
+    d.grab_set()
+    d.resizable(False, False)
+    d.configure(bg=theme["bg"])
+
+    outer = ttk.Frame(d, padding=20)
+    outer.pack(fill="both", expand=True)
+
+    hdr = ttk.Frame(outer)
+    hdr.pack(fill="x", pady=(0, 10))
+    tk.Label(
+        hdr, text=icon_char, font=("Segoe UI", 22), bg=theme["bg"],
+    ).pack(side="left", padx=(0, 10))
+    ttk.Label(hdr, text=title, font=("Segoe UI", 13, "bold"), foreground=accent).pack(side="left", anchor="s")
+
+    ttk.Label(
+        outer, text=message, font=("Segoe UI", 10), wraplength=460, justify="left",
+    ).pack(anchor="w", pady=(0, 4))
+
+    if detail:
+        det_fr = ttk.Frame(outer)
+        det_fr.pack(fill="both", expand=True, pady=(6, 8))
+        det_text = tk.Text(
+            det_fr, wrap="word", width=60, height=min(14, max(4, detail.count("\n") + 2)),
+            bg=theme["input"], fg=theme["fg"], font=("Consolas", 9),
+            relief="flat", bd=0, highlightthickness=0,
+        )
+        det_text.pack(fill="both", expand=True)
+        det_text.insert("1.0", detail)
+        det_text.configure(state="disabled")
+
+    ok_btn = tk.Button(
+        outer, text="OK", command=d.destroy,
+        bg=accent, fg="white", activebackground=accent, activeforeground="white",
+        font=("Segoe UI", 10, "bold"), padx=24, pady=4, cursor="hand2",
+        relief="flat", bd=0,
+    )
+    ok_btn.pack(anchor="e", pady=(8, 0))
+    add_hover_glow(ok_btn, accent)
+
+    d.update_idletasks()
+    w = max(d.winfo_reqwidth(), 380)
+    h = d.winfo_reqheight()
+    px = parent.winfo_rootx() + (parent.winfo_width() - w) // 2
+    py = parent.winfo_rooty() + (parent.winfo_height() - h) // 2
+    d.geometry(f"{w}x{h}+{px}+{py}")
+    d.wait_window()
+
+
 def detected_port_names() -> list[str]:
     ports = serial.tools.list_ports.comports()
     return sorted([p.device for p in ports])
@@ -283,6 +512,24 @@ def to_ml_per_min(value: float, units: str) -> float:
     raise ValueError(f"Unknown rate units: {units}")
 
 
+VOLUME_DISPLAY_UNITS = ("uL", "mL", "L")
+
+
+def format_volume_ul_for_display(ul: float, unit: str) -> str:
+    """Format a volume given in microliters for display in uL, mL, or L."""
+    if not ul:
+        return "0"
+    if unit == "mL":
+        v = ul / 1000.0
+        s = f"{v:.6f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+    if unit == "L":
+        v = ul / 1_000_000.0
+        s = f"{v:.9f}".rstrip("0").rstrip(".")
+        return s if s else "0"
+    return f"{ul:.1f}"
+
+
 @dataclass
 class PumpConnection:
     port: Optional[Port] = None
@@ -304,6 +551,9 @@ class PumpPanel(ttk.LabelFrame):
         self.connection = PumpConnection()
         self.run_start_ts: Optional[float] = None
         self._polling = False
+        self.live_readout_var = tk.StringVar(value="\u2014")
+        self._volume_disp_active_ul: float = 0.0
+        self._volume_disp_total_ul: float = 0.0
         self._build(ports)
 
     def _refresh_frame_title(self) -> None:
@@ -317,10 +567,24 @@ class PumpPanel(ttk.LabelFrame):
         self._refresh_frame_title()
         self.app.schedule_save_pump_labels()
 
+    def _current_volume_display_unit(self) -> str:
+        u = self.volume_display_unit_var.get().strip() if hasattr(self, "volume_display_unit_var") else "uL"
+        return u if u in VOLUME_DISPLAY_UNITS else "uL"
+
+    def _refresh_dispensed_volume_display(self) -> None:
+        u = self._current_volume_display_unit()
+        self.dispensed_ul_var.set(format_volume_ul_for_display(self._volume_disp_active_ul, u))
+        self.total_dispensed_ul_var.set(format_volume_ul_for_display(self._volume_disp_total_ul, u))
+
     def _build(self, ports: list[str]) -> None:
         ttk.Label(self, text="Display name").grid(row=0, column=0, sticky="w")
         ttk.Entry(self, textvariable=self.nickname_var, width=36).grid(
             row=0, column=1, columnspan=5, sticky="w", padx=(6, 0)
+        )
+
+        ttk.Label(self, text="Live status").grid(row=0, column=2, sticky="w")
+        ttk.Label(self, textvariable=self.live_readout_var, wraplength=420).grid(
+            row=0, column=3, columnspan=3, sticky="ew", padx=(6, 0)
         )
 
         ttk.Label(self, text="COM Port").grid(row=1, column=0, sticky="w", pady=(6, 0))
@@ -374,8 +638,19 @@ class PumpPanel(ttk.LabelFrame):
         self.dispense_mode_var.trace_add("write", lambda *_a: self._sync_dispense_volume_visibility())
 
         self.volume_ul_var = tk.StringVar(value="0")
-        self._volume_ul_label = ttk.Label(self, text="Volume to Dispense (uL)")
-        self._volume_ul_entry = ttk.Entry(self, textvariable=self.volume_ul_var, width=10)
+        self._vol_disp_unit_var = tk.StringVar(value="uL")
+        self._volume_ul_label = ttk.Label(self, text="Volume to Dispense")
+        self._vol_disp_frame = ttk.Frame(self)
+        self._volume_ul_entry = ttk.Entry(self._vol_disp_frame, textvariable=self.volume_ul_var, width=10)
+        self._volume_ul_entry.pack(side="left")
+        self._vol_disp_unit_combo = ttk.Combobox(
+            self._vol_disp_frame,
+            textvariable=self._vol_disp_unit_var,
+            values=["uL", "mL", "L"],
+            state="readonly",
+            width=4,
+        )
+        self._vol_disp_unit_combo.pack(side="left", padx=(4, 0))
 
         ttk.Label(self, text="Direction").grid(row=6, column=0, sticky="w", pady=(6, 0))
         self.direction_var = tk.StringVar(value="Infuse")
@@ -383,9 +658,9 @@ class PumpPanel(ttk.LabelFrame):
             row=6, column=1, sticky="w", padx=(6, 10), pady=(6, 0)
         )
 
-        ttk.Label(self, text="Volume Dispensed (uL)").grid(row=6, column=2, sticky="w", pady=(6, 0))
+        ttk.Label(self, text="Volume Dispensed").grid(row=6, column=2, sticky="w", pady=(6, 0))
         self.dispensed_ul_var = tk.StringVar(value="0")
-        ttk.Entry(self, textvariable=self.dispensed_ul_var, width=10, state="readonly").grid(
+        ttk.Entry(self, textvariable=self.dispensed_ul_var, width=14, state="readonly").grid(
             row=6, column=3, sticky="w", padx=(6, 0), pady=(6, 0)
         )
 
@@ -395,31 +670,71 @@ class PumpPanel(ttk.LabelFrame):
             row=7, column=1, sticky="w", padx=(6, 10), pady=(6, 0)
         )
 
-        ttk.Label(self, text="Total Volume Dispensed (uL)").grid(row=7, column=2, sticky="w", pady=(6, 0))
+        ttk.Label(self, text="Total Volume Dispensed").grid(row=7, column=2, sticky="w", pady=(6, 0))
         self.total_dispensed_ul_var = tk.StringVar(value="0")
-        ttk.Entry(self, textvariable=self.total_dispensed_ul_var, width=10, state="readonly").grid(
+        ttk.Entry(self, textvariable=self.total_dispensed_ul_var, width=14, state="readonly").grid(
             row=7, column=3, sticky="w", padx=(6, 0), pady=(6, 0)
         )
 
+        self.volume_display_unit_var = tk.StringVar(value="uL")
+        vol_unit_fr = ttk.Frame(self)
+        vol_unit_fr.grid(row=6, column=4, rowspan=2, sticky="nw", padx=(8, 0), pady=(6, 0))
+        ttk.Label(vol_unit_fr, text="Display as").pack(anchor="w")
+        self._volume_unit_combo = ttk.Combobox(
+            vol_unit_fr,
+            textvariable=self.volume_display_unit_var,
+            values=VOLUME_DISPLAY_UNITS,
+            state="readonly",
+            width=5,
+        )
+        self._volume_unit_combo.pack(anchor="w", pady=(4, 0))
+        self.volume_display_unit_var.trace_add("write", lambda *_a: self._refresh_dispensed_volume_display())
+        self._refresh_dispensed_volume_display()
+
         btn_row = ttk.Frame(self)
-        btn_row.grid(row=8, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        for idx in range(8):
+        btn_row.grid(row=8, column=0, columnspan=6, sticky="ew", pady=(10, 0))
+        for idx in range(4):
             btn_row.columnconfigure(idx, weight=1)
         ttk.Button(btn_row, text="Manual Connect", command=self.connect).grid(row=0, column=0, padx=4, sticky="ew")
         ttk.Button(btn_row, text="Disconnect", command=self.disconnect).grid(row=0, column=1, padx=4, sticky="ew")
         ttk.Button(btn_row, text="Reinitialize", command=self.reinitialize).grid(row=0, column=2, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Apply", command=lambda: self.app.apply_with_mode(self)).grid(row=0, column=3, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Run", command=lambda: self.app.run_with_mode(self)).grid(row=0, column=4, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Stop", command=lambda: self.app.stop_with_mode(self)).grid(row=0, column=5, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Read", command=self.read_status_async).grid(row=0, column=6, padx=4, sticky="ew")
-        ttk.Button(btn_row, text="Reset Volume", command=self.reset_volume_async).grid(row=0, column=7, padx=4, sticky="ew")
+        ttk.Button(btn_row, text="Reset Volume", command=self.reset_volume_async).grid(row=0, column=3, padx=4, sticky="ew")
 
-        btn_row2 = ttk.Frame(self)
-        btn_row2.grid(row=9, column=0, columnspan=4, sticky="w", pady=(6, 0))
-        ttk.Button(btn_row2, text="Pump Auto-Connect", command=self.auto_connect_pump).pack(side="left", padx=4)
+        action_grid = ttk.Frame(self)
+        action_grid.grid(row=9, column=0, columnspan=6, sticky="ew", pady=(8, 4))
+        action_grid.columnconfigure(0, weight=1, uniform="act")
+        action_grid.columnconfigure(1, weight=1, uniform="act")
+
+        auto_btn = tk.Button(
+            action_grid, text="Pump Auto-Connect", command=self.auto_connect_pump,
+            font=("Segoe UI", 10, "bold"), pady=8, cursor="hand2",
+        )
+        auto_btn.grid(row=0, column=0, sticky="nsew", padx=(4, 3), pady=(0, 3))
+        add_hover_glow(auto_btn)
+        apply_btn = tk.Button(
+            action_grid, text="Apply Settings",
+            command=lambda: self.app.apply_with_mode(self),
+            cursor="hand2", pady=8, **BTN_APPLY_ACCENT,
+        )
+        apply_btn.grid(row=0, column=1, sticky="nsew", padx=(3, 4), pady=(0, 3))
+        add_hover_glow(apply_btn, BTN_APPLY_ACCENT["bg"])
+        run_btn = tk.Button(
+            action_grid, text="Run", command=lambda: self.app.run_with_mode(self),
+            bg="#28A745", fg="white", activebackground="#218838", activeforeground="white",
+            font=("Segoe UI", 10, "bold"), pady=8, cursor="hand2", relief="raised", bd=2,
+        )
+        run_btn.grid(row=1, column=0, sticky="nsew", padx=(4, 3), pady=(3, 0))
+        add_hover_glow(run_btn, "#28A745")
+        stop_btn = tk.Button(
+            action_grid, text="Stop", command=lambda: self.app.stop_with_mode(self),
+            bg="#DC3545", fg="white", activebackground="#C82333", activeforeground="white",
+            font=("Segoe UI", 10, "bold"), pady=8, cursor="hand2", relief="raised", bd=2,
+        )
+        stop_btn.grid(row=1, column=1, sticky="nsew", padx=(3, 4), pady=(3, 0))
+        add_hover_glow(stop_btn, "#DC3545")
 
         self.status_var = tk.StringVar(value="Not connected")
-        ttk.Label(self, textvariable=self.status_var).grid(row=10, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Label(self, textvariable=self.status_var).grid(row=10, column=0, columnspan=6, sticky="w", pady=(8, 0))
         self.columnconfigure(1, weight=1)
         self._on_syringe_preset_change()
         self.nickname_var.trace_add("write", lambda *_a: self._on_nickname_changed())
@@ -460,13 +775,13 @@ class PumpPanel(ttk.LabelFrame):
             self.custom_diameter_var.set(f"{value:.2f}")
 
     def _sync_dispense_volume_visibility(self) -> None:
-        """Continuous: hide volume-to-dispense. Volume: show it on its own row."""
+        """Continuous: hide volume-to-dispense. Volume: show it to the right of Dispense Mode."""
         if self.dispense_mode_var.get() == "Volume":
-            self._volume_ul_label.grid(row=5, column=0, sticky="w", pady=(6, 0))
-            self._volume_ul_entry.grid(row=5, column=1, sticky="w", padx=(6, 10), pady=(6, 0))
+            self._volume_ul_label.grid(row=4, column=2, sticky="w", pady=(6, 0))
+            self._vol_disp_frame.grid(row=4, column=3, sticky="w", padx=(6, 0), pady=(6, 0))
         else:
             self._volume_ul_label.grid_remove()
-            self._volume_ul_entry.grid_remove()
+            self._vol_disp_frame.grid_remove()
 
     def _get_baud_rate(self) -> int:
         return int(self.baud_var.get().strip())
@@ -551,9 +866,11 @@ class PumpPanel(ttk.LabelFrame):
 
             def reset_ui() -> None:
                 self.set_status("Not connected")
-                self.dispensed_ul_var.set("0")
-                self.total_dispensed_ul_var.set("0")
+                self._volume_disp_active_ul = 0.0
+                self._volume_disp_total_ul = 0.0
+                self._refresh_dispensed_volume_display()
                 self.time_sec_var.set("0")
+                self.live_readout_var.set("\u2014")
 
             self.after(0, reset_ui)
 
@@ -624,7 +941,14 @@ class PumpPanel(ttk.LabelFrame):
         diameter_mm = float(self.custom_diameter_var.get().strip())
         rate_value = float(self.rate_var.get().strip())
         rate_ml_per_min = to_ml_per_min(rate_value, self.rate_units_var.get())
-        volume_ul = float(self.volume_ul_var.get().strip())
+        volume_raw = float(self.volume_ul_var.get().strip())
+        vol_unit = self._vol_disp_unit_var.get().strip() if hasattr(self, "_vol_disp_unit_var") else "uL"
+        if vol_unit == "mL":
+            volume_ul = volume_raw * 1000.0
+        elif vol_unit == "L":
+            volume_ul = volume_raw * 1_000_000.0
+        else:
+            volume_ul = volume_raw
         volume_ml = max(volume_ul, 0.0) / 1000.0
         direction = PumpingDirection.INFUSE if self.direction_var.get() == "Infuse" else PumpingDirection.WITHDRAW
 
@@ -633,7 +957,7 @@ class PumpPanel(ttk.LabelFrame):
         pump.pumping_direction = direction
         if self.dispense_mode_var.get() == "Volume":
             if volume_ml <= 0.0:
-                raise ValueError("Volume mode requires a positive 'Volume to Dispense (uL)'.")
+                raise ValueError("Volume mode requires a positive 'Volume to Dispense'.")
             pump.pumping_volume = volume_ml
 
     def run_sync(self) -> None:
@@ -656,9 +980,15 @@ class PumpPanel(ttk.LabelFrame):
         total_ul = infused_ul + withdrawn_ul
 
         def update_ui() -> None:
-            self.dispensed_ul_var.set(f"{active_ul:.1f}")
-            self.total_dispensed_ul_var.set(f"{total_ul:.1f}")
+            self._volume_disp_active_ul = active_ul
+            self._volume_disp_total_ul = total_ul
+            self._refresh_dispensed_volume_display()
+            u = self._current_volume_display_unit()
             self.set_status(f"Status: {status_name}")
+            self.live_readout_var.set(
+                f"{status_name} \u00b7 Active: {format_volume_ul_for_display(active_ul, u)} {u} \u00b7 "
+                f"Total: {format_volume_ul_for_display(total_ul, u)} {u}"
+            )
 
         self.after(0, update_ui)
 
@@ -670,9 +1000,14 @@ class PumpPanel(ttk.LabelFrame):
             pump = self._require_pump()
             pump.volume_infused_clear()
             pump.volume_withdrawn_clear()
-            self.after(0, lambda: self.dispensed_ul_var.set("0"))
-            self.after(0, lambda: self.total_dispensed_ul_var.set("0"))
-            self.after(0, lambda: self.set_status("Volume counters reset"))
+
+            def reset_ui() -> None:
+                self._volume_disp_active_ul = 0.0
+                self._volume_disp_total_ul = 0.0
+                self._refresh_dispensed_volume_display()
+                self.set_status("Volume counters reset")
+
+            self.after(0, reset_ui)
 
         self._run_in_thread(work)
 
@@ -709,6 +1044,8 @@ class VacuumPanel(ttk.LabelFrame):
         self.connected_com: Optional[str] = None
         self.connected_since_ts: Optional[float] = None
         self.is_on = False
+        self._vacuum_blink_after_id: Optional[Any] = None
+        self._vacuum_blink_phase = False
         self._build(ports)
 
     def _build(self, ports: list[str]) -> None:
@@ -746,6 +1083,9 @@ class VacuumPanel(ttk.LabelFrame):
             padx=10, pady=8, cursor="hand2",
         )
         self.toggle_btn.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self._toggle_hover_base: Optional[str] = None
+        self.toggle_btn.bind("<Enter>", self._on_toggle_enter, add=True)
+        self.toggle_btn.bind("<Leave>", self._on_toggle_leave, add=True)
         self._set_button_color()
 
         self.status_var = tk.StringVar(value="Vacuum OFF")
@@ -767,11 +1107,46 @@ class VacuumPanel(ttk.LabelFrame):
     def _set_conn_status(self, text: str) -> None:
         self.conn_status_var.set(text)
 
-    def _set_button_color(self) -> None:
-        if self.is_on:
-            self.toggle_btn.configure(bg="#C0392B", activebackground="#A93226")
+    def _stop_vacuum_blink(self) -> None:
+        if self._vacuum_blink_after_id is not None:
+            try:
+                self.after_cancel(self._vacuum_blink_after_id)
+            except tk.TclError:
+                pass
+            self._vacuum_blink_after_id = None
+
+    def _vacuum_blink_tick(self) -> None:
+        if not self.is_on:
+            self._vacuum_blink_after_id = None
+            return
+        self._vacuum_blink_phase = not self._vacuum_blink_phase
+        if self._vacuum_blink_phase:
+            self.toggle_btn.configure(bg="#1D4ED8", activebackground="#1E40AF")
         else:
-            self.toggle_btn.configure(bg="#1E8449", activebackground="#196F3D")
+            self.toggle_btn.configure(bg="#3B82F6", activebackground="#2563EB")
+        self._vacuum_blink_after_id = self.after(450, self._vacuum_blink_tick)
+
+    def _set_button_color(self) -> None:
+        self._stop_vacuum_blink()
+        if self.is_on:
+            self.toggle_btn.configure(fg="white", activeforeground="white")
+            self._vacuum_blink_phase = False
+            self.toggle_btn.configure(bg="#3B82F6", activebackground="#2563EB")
+            self._vacuum_blink_after_id = self.after(450, self._vacuum_blink_tick)
+        else:
+            self.toggle_btn.configure(
+                bg="#E67E22", fg="white",
+                activebackground="#D35400", activeforeground="white",
+            )
+
+    def _on_toggle_enter(self, _e: Any) -> None:
+        self._toggle_hover_base = _resolve_color_to_hex(self.toggle_btn, self.toggle_btn.cget("bg"))
+        self.toggle_btn.configure(bg=_brighten_hex(self._toggle_hover_base, 40))
+
+    def _on_toggle_leave(self, _e: Any) -> None:
+        if self._toggle_hover_base is not None:
+            self.toggle_btn.configure(bg=self._toggle_hover_base)
+            self._toggle_hover_base = None
 
     def _set_reply(self, text: str) -> None:
         self.reply_var.set(f"Arduino reply: {text}")
@@ -926,6 +1301,7 @@ class VacuumPanel(ttk.LabelFrame):
         threading.Thread(target=work, daemon=True).start()
 
     def close(self) -> None:
+        self._stop_vacuum_blink()
         self._close_serial()
 
 
@@ -1751,8 +2127,7 @@ class RecipesPanel(ttk.Frame):
                 parent=self.winfo_toplevel(),
             )
             return
-        self.app.run_recipe(rec)
-        self._set_status(f"Started “{rec.get('name', '')}” on connected pumps (see main window).")
+        self.app._confirm_and_run_recipe(rec)
 
     def _on_run_sequence(self) -> None:
         rec = self._selected_recipe()
@@ -1767,8 +2142,7 @@ class RecipesPanel(ttk.Frame):
                 parent=self.winfo_toplevel(),
             )
             return
-        self.app.run_recipe_sequence(rec)
-        self._set_status(f"Running sequence “{rec.get('name', '')}”…")
+        self.app._confirm_and_run_recipe(rec)
 
     def _open_sequence_editor(self) -> None:
         rec = self._selected_recipe()
@@ -1822,14 +2196,20 @@ class PumpControllerApp(tk.Tk):
         self._quick_recipe_combo: Optional[ttk.Combobox] = None
         self._run_recipe_btn: Optional[tk.Button] = None
         self._abort_recipe_btn: Optional[ttk.Button] = None
+        self._resize_after_id: Optional[str] = None
+        self._body_frame: Optional[ttk.Frame] = None
+        self._last_wm_size: tuple[int, int] = (0, 0)
         self._style = ttk.Style(self)
         self._style.theme_use("clam")
         self._build()
         self._schedule_live_updates()
+        self.after(300, self._capture_initial_size)
+        self.bind("<Configure>", self._on_configure)
 
     def _build(self) -> None:
         header = ttk.Frame(self, padding=12)
         header.pack(fill="x")
+        self._header_frame = header
         ttk.Label(header, text="Mode").pack(side="left")
         ttk.Combobox(
             header,
@@ -1843,7 +2223,13 @@ class PumpControllerApp(tk.Tk):
         self.dark_mode_btn = ttk.Button(header, text="Dark Mode", command=self.toggle_dark_mode)
         self.dark_mode_btn.pack(side="left", padx=(16, 0))
 
-        ttk.Button(header, text="Power Off (Stop All)", command=self.power_off).pack(side="right")
+        power_btn = tk.Button(
+            header, text="Power Off (Stop All)", command=self.power_off,
+            cursor="hand2", padx=10, pady=4, relief="raised", bd=2,
+            **BTN_POWER_OFF_ABORT,
+        )
+        power_btn.pack(side="right")
+        add_hover_glow(power_btn, BTN_POWER_OFF_ABORT["bg"])
         ttk.Button(header, text="Recipes…", command=self.open_recipes_window).pack(side="right", padx=(0, 10))
         self._abort_recipe_btn = ttk.Button(header, text="Abort recipe", command=self.abort_recipe_run, state="disabled")
         self._abort_recipe_btn.pack(side="right", padx=(0, 6))
@@ -1857,8 +2243,10 @@ class PumpControllerApp(tk.Tk):
             activebackground=theme0["btn_hover"],
             padx=8,
             pady=2,
+            cursor="hand2",
         )
         self._run_recipe_btn.pack(side="right", padx=(0, 6))
+        add_hover_glow(self._run_recipe_btn, theme0["btn"])
         self._quick_recipe_combo = ttk.Combobox(
             header,
             textvariable=self._quick_recipe_var,
@@ -1871,10 +2259,11 @@ class PumpControllerApp(tk.Tk):
 
         body = ttk.Frame(self, padding=(12, 0, 12, 12))
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
-        body.columnconfigure(1, weight=1)
-        body.rowconfigure(0, weight=1)
-        body.rowconfigure(1, weight=1)
+        body.columnconfigure(0, weight=1, uniform="panel")
+        body.columnconfigure(1, weight=1, uniform="panel")
+        body.rowconfigure(0, weight=1, uniform="row")
+        body.rowconfigure(1, weight=1, uniform="row")
+        self._body_frame = body
 
         ports = detected_port_names()
         self.panels.append(PumpPanel(body, self, 1, ports))
@@ -1887,16 +2276,33 @@ class PumpControllerApp(tk.Tk):
         self.panels[2].grid(row=1, column=0, sticky="nsew", padx=(0, 8))
         self.vacuum_panel.grid(row=1, column=1, sticky="nsew")
 
+        for p in self.panels:
+            p.grid_propagate(False)
+        self.vacuum_panel.grid_propagate(False)
+
         pl = load_pump_labels_file()
         for i, panel in enumerate(self.panels):
             panel.nickname_var.set(pl.get(str(i + 1), ""))
             panel._refresh_frame_title()
 
-        ttk.Label(
-            self,
+        bottom_bar = ttk.Frame(self, padding=(12, 0, 12, 8))
+        bottom_bar.pack(fill="x", side="bottom")
+        self._tip_label = ttk.Label(
+            bottom_bar,
             text="Tip: you can type COM ports manually (e.g. COM3) even if no hardware is connected now.",
-            padding=(12, 0, 12, 12),
-        ).pack(anchor="w")
+        )
+        self._tip_label.pack(side="left", anchor="w")
+
+        self._progress_frame = ttk.Frame(bottom_bar)
+        self._progress_frame.pack(side="right")
+        self._progress_label = ttk.Label(self._progress_frame, text="")
+        self._progress_label.pack(side="top", anchor="e")
+        self._progress_bar = ttk.Progressbar(self._progress_frame, length=260, mode="determinate")
+        self._progress_bar.pack(side="top", anchor="e", pady=(2, 0))
+        self._progress_frame.pack_forget()
+        self._progress_start_time: float = 0.0
+        self._progress_total_time: float = 0.0
+        self._progress_tick_id: Optional[str] = None
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_quick_recipe_combo()
@@ -1917,21 +2323,172 @@ class PumpControllerApp(tk.Tk):
         else:
             self._quick_recipe_var.set("")
 
+    def _capture_initial_size(self) -> None:
+        self._last_wm_size = (self.winfo_width(), self.winfo_height())
+
+    def _on_configure(self, event: Any) -> None:
+        if event.widget is not self:
+            return
+        new_size = (event.width, event.height)
+        if new_size == self._last_wm_size:
+            return
+        self._last_wm_size = new_size
+        if self._body_frame is not None and self._body_frame.winfo_ismapped():
+            self._body_frame.pack_forget()
+        if self._resize_after_id is not None:
+            self.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.after(80, self._finish_resize)
+
+    def _finish_resize(self) -> None:
+        self._resize_after_id = None
+        if self._body_frame is not None and not self._body_frame.winfo_ismapped():
+            self._body_frame.pack(after=self._header_frame, fill="both", expand=True)
+
+    def _show_progress_bar(self, total_seconds: float) -> None:
+        self._progress_total_time = max(total_seconds, 0.1)
+        self._progress_start_time = time.time()
+        self._progress_bar.configure(maximum=100, value=0)
+        self._progress_label.configure(text=f"Recipe running \u2014 0% (est. {_format_duration(total_seconds)})")
+        self._progress_frame.pack(side="right")
+        self._progress_tick()
+
+    def _progress_tick(self) -> None:
+        if not self._recipe_thread_running:
+            return
+        elapsed = time.time() - self._progress_start_time
+        pct = min(100.0, (elapsed / self._progress_total_time) * 100.0)
+        remaining = max(0.0, self._progress_total_time - elapsed)
+        self._progress_bar.configure(value=pct)
+        self._progress_label.configure(text=f"Recipe running \u2014 {pct:.0f}%  ({_format_duration(remaining)} remaining)")
+        self._progress_tick_id = self.after(500, self._progress_tick)
+
+    def _hide_progress_bar(self) -> None:
+        if self._progress_tick_id is not None:
+            try:
+                self.after_cancel(self._progress_tick_id)
+            except tk.TclError:
+                pass
+            self._progress_tick_id = None
+        self._progress_frame.pack_forget()
+
+    def _preflight_check(self, recipe: dict[str, Any]) -> Optional[str]:
+        """Return an error string if the recipe can't run, or None if OK."""
+        if self._recipe_thread_running:
+            return "A recipe is already running. Abort it first or wait until it finishes."
+        return None
+
+    def _confirm_and_run_recipe(self, recipe: dict[str, Any], *, from_toolbar: bool = False) -> None:
+        """Show a confirmation dialog with recipe summary, then run."""
+        err = self._preflight_check(recipe)
+        if err:
+            messagebox.showwarning("Cannot Run Recipe", err, parent=self)
+            return
+
+        name = recipe.get("name", "(untitled)")
+        steps = recipe.get("steps")
+        is_sequence = isinstance(steps, list) and len(steps) > 0
+        est_time = _estimate_recipe_time(recipe) if is_sequence else 0.0
+        pumps_used, vacuum_needed = _recipe_resources(recipe)
+        nicks = self.pump_nickname_map()
+
+        theme = DARK if self.dark_mode else LIGHT
+        d = tk.Toplevel(self)
+        d.title(f"Run recipe — {name}")
+        d.transient(self)
+        d.grab_set()
+        d.resizable(True, True)
+        d.configure(bg=theme["bg"])
+
+        outer = ttk.Frame(d, padding=20)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, text=name, font=("Segoe UI", 14, "bold")).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text=f"Estimated time: {_format_duration(est_time)}" if is_sequence else "Simple recipe (apply + run connected pumps)",
+            font=("Segoe UI", 10),
+        ).pack(anchor="w", pady=(2, 10))
+
+        cards = ttk.Frame(outer)
+        cards.pack(fill="x", pady=(0, 8))
+        cards.columnconfigure(0, weight=1, uniform="card")
+        cards.columnconfigure(1, weight=1, uniform="card")
+        cards.columnconfigure(2, weight=1, uniform="card")
+
+        def _card(parent: ttk.Frame, col: int, title_text: str, body_text: str) -> None:
+            fr = ttk.LabelFrame(parent, text=title_text, padding=8)
+            fr.grid(row=0, column=col, sticky="nsew", padx=(0 if col == 0 else 4, 0))
+            ttk.Label(fr, text=body_text, wraplength=160).pack(anchor="w")
+
+        pump_desc = ", ".join(
+            f"Pump {p}" + (f" ({nicks[p]})" if p in nicks else "")
+            for p in sorted(pumps_used)
+        ) if pumps_used else "(none detected)"
+        _card(cards, 0, "PUMPS", pump_desc)
+        _card(cards, 1, "VACUUM", "Required" if vacuum_needed else "Not used")
+        _card(cards, 2, "STEPS", f"{len(steps)} steps" if is_sequence else "Apply + Run")
+
+        if is_sequence:
+            ttk.Label(outer, text="Steps:", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 2))
+            steps_fr = ttk.Frame(outer)
+            steps_fr.pack(fill="both", expand=True, pady=(0, 8))
+            steps_fr.rowconfigure(0, weight=1)
+            steps_fr.columnconfigure(0, weight=1)
+            sl = tk.Listbox(
+                steps_fr, height=min(12, max(4, len(steps))),
+                bg=theme["input"], fg=theme["fg"],
+                selectbackground=theme["btn"], selectforeground=theme["fg"],
+                highlightthickness=0, borderwidth=1, relief="solid",
+            )
+            sl.grid(row=0, column=0, sticky="nsew")
+            ssb = ttk.Scrollbar(steps_fr, orient="vertical", command=sl.yview)
+            ssb.grid(row=0, column=1, sticky="ns")
+            sl.configure(yscrollcommand=ssb.set)
+            for i, st in enumerate(steps):
+                if isinstance(st, dict):
+                    sl.insert(tk.END, format_step_list_line(i, st, nicks))
+
+        confirmed = [False]
+
+        def on_confirm() -> None:
+            confirmed[0] = True
+            d.destroy()
+
+        btn_fr = ttk.Frame(outer)
+        btn_fr.pack(fill="x", pady=(8, 0))
+        ttk.Button(btn_fr, text="Cancel", command=d.destroy).pack(side="left")
+        confirm_btn = tk.Button(
+            btn_fr, text="Confirm & Run", command=on_confirm,
+            bg="#28A745", fg="white", activebackground="#218838", activeforeground="white",
+            font=("Segoe UI", 10, "bold"), padx=16, pady=4, cursor="hand2",
+            relief="flat", bd=0,
+        )
+        confirm_btn.pack(side="right")
+        add_hover_glow(confirm_btn, "#28A745")
+
+        d.update_idletasks()
+        w = max(d.winfo_reqwidth(), 520)
+        h = max(d.winfo_reqheight(), 350)
+        px = self.winfo_rootx() + (self.winfo_width() - w) // 2
+        py = self.winfo_rooty() + (self.winfo_height() - h) // 2
+        d.geometry(f"{w}x{h}+{px}+{py}")
+        d.wait_window()
+
+        if not confirmed[0]:
+            return
+
+        if is_sequence:
+            self.run_recipe_sequence(recipe, from_toolbar=from_toolbar)
+        else:
+            self.run_recipe(recipe, from_toolbar=from_toolbar)
+
     def _on_toolbar_run_recipe(self) -> None:
         if self._recipe_thread_running:
-            messagebox.showwarning(
-                "Recipe",
-                "A recipe is already running. Use “Abort recipe” or wait until it finishes.",
-                parent=self,
-            )
+            messagebox.showwarning("Recipe", "A recipe is already running. Use \"Abort recipe\" or wait until it finishes.", parent=self)
             return
         recipes = self._quick_recipes_cache
         if not recipes:
-            messagebox.showinfo(
-                "Recipe",
-                "No saved recipes yet. Open “Recipes…” and use “Save from main window”.",
-                parent=self,
-            )
+            messagebox.showinfo("Recipe", "No saved recipes yet. Open \"Recipes\" and use \"Save from main window\".", parent=self)
             return
         idx = -1
         if self._quick_recipe_combo is not None:
@@ -1949,11 +2506,7 @@ class PumpControllerApp(tk.Tk):
             messagebox.showinfo("Recipe", "Select a recipe from the drop-down.", parent=self)
             return
         rec = recipes[idx]
-        steps = rec.get("steps")
-        if isinstance(steps, list) and len(steps) > 0:
-            self.run_recipe_sequence(rec, from_toolbar=True)
-        else:
-            self.run_recipe(rec, from_toolbar=True)
+        self._confirm_and_run_recipe(rec, from_toolbar=True)
 
     def abort_recipe_run(self) -> None:
         """Signal the background recipe worker to stop between steps (and during delays)."""
@@ -1987,13 +2540,16 @@ class PumpControllerApp(tk.Tk):
             theme = DARK if self.dark_mode else LIGHT
             self._run_recipe_btn.configure(bg=theme["btn"], fg=theme["fg"], activebackground=theme["btn_hover"])
 
-    def _finish_recipe_run(self, from_toolbar: bool) -> None:
+    def _finish_recipe_run(self, from_toolbar: bool, recipe_name: str = "", aborted: bool = False) -> None:
         self._recipe_thread_running = False
         self._recipe_abort_event.clear()
         if from_toolbar:
             self._stop_run_recipe_blink()
         if self._abort_recipe_btn is not None and self._abort_recipe_btn.winfo_exists():
             self._abort_recipe_btn.configure(state="disabled")
+        self._hide_progress_bar()
+        if recipe_name and not aborted:
+            messagebox.showinfo("Recipe Complete", f'Recipe "{recipe_name}" Complete', parent=self)
 
     def _begin_recipe_run(self, from_toolbar: bool) -> None:
         self._recipe_abort_event.clear()
@@ -2060,22 +2616,26 @@ class PumpControllerApp(tk.Tk):
         if not isinstance(steps, list) or not steps:
             return
         if self._recipe_thread_running:
-            messagebox.showwarning(
-                "Recipe",
-                "A recipe is already running. Abort it first or wait until it finishes.",
-                parent=self,
-            )
+            messagebox.showwarning("Recipe", "A recipe is already running. Abort it first or wait until it finishes.", parent=self)
             return
 
+        recipe_name = recipe.get("name", "")
+        est = _estimate_recipe_time(recipe)
         self._begin_recipe_run(from_toolbar)
+        if est > 0:
+            self._show_progress_bar(est)
         abort = self._recipe_abort_event
         app = self
+        nicks = self.pump_nickname_map()
 
         def worker() -> None:
+            had_error = False
+            was_aborted = False
             try:
                 vac = app.vacuum_panel
                 for idx, step in enumerate(steps):
                     if abort.is_set():
+                        was_aborted = True
                         return
                     if not isinstance(step, dict):
                         continue
@@ -2084,6 +2644,7 @@ class PumpControllerApp(tk.Tk):
                         if st == "delay":
                             abortable_sleep(max(0.0, float(step.get("seconds", 0))), abort)
                             if abort.is_set():
+                                was_aborted = True
                                 return
                         elif st == "connect_pump":
                             p = int(step["pump"])
@@ -2100,9 +2661,11 @@ class PumpControllerApp(tk.Tk):
                                 panel.address_var.set(str(addr))
 
                             if abort.is_set():
+                                was_aborted = True
                                 return
                             run_on_main_thread(app, set_p_fields)
                             if abort.is_set():
+                                was_aborted = True
                                 return
                             panel.connect_with_params(com, baud, addr)
                         elif st == "disconnect_pump":
@@ -2119,18 +2682,22 @@ class PumpControllerApp(tk.Tk):
                                 panel.apply_settings_from_snapshot(settings)
 
                             if abort.is_set():
+                                was_aborted = True
                                 return
                             run_on_main_thread(app, apply_u)
                             if abort.is_set():
+                                was_aborted = True
                                 return
                             panel.apply_settings_sync()
                         elif st == "run_pump":
                             p = int(step["pump"])
                             panel = app.panels[p - 1]
                             if abort.is_set():
+                                was_aborted = True
                                 return
                             panel.apply_settings_sync()
                             if abort.is_set():
+                                was_aborted = True
                                 return
                             panel.run_sync()
                         elif st == "stop_pump":
@@ -2146,9 +2713,11 @@ class PumpControllerApp(tk.Tk):
                                 vac.com_var.set(com)
 
                             if abort.is_set():
+                                was_aborted = True
                                 return
                             run_on_main_thread(app, set_v)
                             if abort.is_set():
+                                was_aborted = True
                                 return
                             vac.open_serial_explicit(com, baud)
                             vac._wait_until_ready()
@@ -2166,55 +2735,66 @@ class PumpControllerApp(tk.Tk):
                         else:
                             raise ValueError(f"Unknown step type: {st}")
                     except Exception as exc:
-                        msg = str(exc)
+                        had_error = True
+                        detail = _friendly_step_error(step, idx, str(exc), nicks)
                         app.after(
                             0,
-                            lambda m=msg, i=idx: messagebox.showerror(
-                                "Recipe sequence",
-                                f"Step {i + 1} failed:\n{m}",
-                                parent=app,
-                            ),
+                            lambda d=detail: messagebox.showerror("Recipe Failed", d, parent=app),
                         )
                         return
             finally:
-                app.after(0, lambda ftb=from_toolbar: app._finish_recipe_run(ftb))
+                app.after(0, lambda ftb=from_toolbar, rn=recipe_name, ab=(was_aborted or had_error): app._finish_recipe_run(ftb, recipe_name=rn, aborted=ab))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def run_recipe(self, recipe: dict[str, Any], *, from_toolbar: bool = False) -> None:
         """Apply recipe to panel fields, then apply+run each pump that is connected."""
         if self._recipe_thread_running:
-            messagebox.showwarning(
-                "Recipe",
-                "A recipe is already running. Abort it first or wait until it finishes.",
-                parent=self,
-            )
+            messagebox.showwarning("Recipe", "A recipe is already running. Abort it first or wait until it finishes.", parent=self)
             return
 
+        recipe_name = recipe.get("name", "")
         self._begin_recipe_run(from_toolbar)
         self.apply_recipe_to_panels(recipe)
         abort = self._recipe_abort_event
         app = self
 
         def work() -> None:
+            had_error = False
+            was_aborted = False
+            any_ran = False
             try:
                 for panel in app.panels:
                     if abort.is_set():
+                        was_aborted = True
                         return
                     if panel.connection.pump is None:
-                        panel.after(0, lambda p=panel: p.set_status("Recipe: not connected — skipped"))
+                        panel.after(0, lambda p=panel: p.set_status("Recipe: not connected \u2014 skipped"))
                         continue
                     try:
                         panel.apply_settings_sync()
                         if abort.is_set():
+                            was_aborted = True
                             return
                         panel.run_sync()
+                        any_ran = True
                         panel.after(0, lambda p=panel: p.set_status("Running (recipe)"))
                     except Exception as exc:
+                        had_error = True
                         msg = str(exc)
                         panel.after(0, lambda p=panel, m=msg: p.set_status(f"Recipe error: {m}"))
+                if not any_ran and not had_error and not was_aborted:
+                    app.after(
+                        0,
+                        lambda rn=recipe_name: messagebox.showerror(
+                            "Recipe Failed",
+                            f'Recipe "{rn}" could not run.\n\nNo pumps were connected. Connect the required pumps and try again.',
+                            parent=app,
+                        ),
+                    )
+                    had_error = True
             finally:
-                app.after(0, lambda ftb=from_toolbar: app._finish_recipe_run(ftb))
+                app.after(0, lambda ftb=from_toolbar, rn=recipe_name, ab=(was_aborted or had_error): app._finish_recipe_run(ftb, recipe_name=rn, aborted=ab))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -2312,9 +2892,9 @@ class PumpControllerApp(tk.Tk):
         if self.vacuum_panel is not None:
             self.vacuum_panel.update_port_choices(ports)
         if ports:
-            messagebox.showinfo("COM Ports", "Detected: " + ", ".join(ports))
+            messagebox.showinfo("COM Ports", "Detected: " + ", ".join(ports), parent=self)
         else:
-            messagebox.showinfo("COM Ports", "No COM ports detected. Manual entry is still available.")
+            messagebox.showinfo("COM Ports", "No COM ports detected. Manual entry is still available.", parent=self)
 
     def power_off(self) -> None:
         def work() -> None:
