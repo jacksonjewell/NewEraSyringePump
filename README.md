@@ -29,6 +29,9 @@ Built for the Wanunu Lab at Northeastern University.
 
 - Python 3.x
 - Git for Windows (if using Claude Code or cloning repo)
+- New Era NE-1000 Syringe Pumps (3x)
+- Arduino UNO
+- Vacuum Pump
 
 ## Setup
 
