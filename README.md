@@ -156,7 +156,3 @@ requirements.txt                 Python dependencies
 
 - [NESP-Lib](https://github.com/florian-lapp/nesp-lib-py) — New Era Syringe Pump Library for Python
 - [pyserial](https://pypi.org/project/pyserial/) — Serial port access for Arduino communication
-
-## License
-
-Internal lab use.
