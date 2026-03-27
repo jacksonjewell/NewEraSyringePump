@@ -145,10 +145,10 @@ pump_control_gui.py              Main GUI application
 pump_environment_check.py        Quick hardware/environment readiness check
 arduino/VacuumPumpV1/            Arduino vacuum sketch (VacuumPumpV1.ino)
 recipes.example.json             Reference example of the JSON format
-recipes.json                     Saved recipes (tracked in git for multi-PC sync)
-pump_labels.json                 Pump nicknames (tracked in git)
+recipes.json                     Saved recipes
+pump_labels.json                 Customizable name of pump
 push_recipes.ps1                 Commit + push recipes.json and pump_labels.json only
-requirements.txt                 Python dependencies (NESP-Lib, pyserial)
+requirements.txt                 Python dependencies
 .gitignore                       Excludes venv, cache, IDE files, logs
 ```
 
