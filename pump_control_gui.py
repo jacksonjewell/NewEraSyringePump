@@ -2849,11 +2849,23 @@ class PumpControllerApp(tk.Tk):
     def _run_group_action(self, source_panel: PumpPanel, action_name: str) -> None:
         targets = self._targets_for_action(source_panel)
         snapshot = source_panel.snapshot_settings()
+        app = self
 
         def work() -> None:
             for panel in targets:
                 if panel is not source_panel:
-                    panel.after(0, lambda p=panel: p.apply_settings_from_snapshot(snapshot))
+                    # Apply the source panel's snapshot to the target panel on
+                    # the GUI thread and WAIT for it to complete before reading
+                    # values back via apply_settings_sync. Using a fire-and-
+                    # forget after(0, ...) here would race: the worker thread
+                    # would proceed to apply_settings_sync (which reads the
+                    # panel's Tk variables) before the snapshot was actually
+                    # written to those variables, causing the target pump to
+                    # be programmed with its previous, stale rate/volume —
+                    # potentially overdosing in Dual/Triple "Switch Together"
+                    # mode (e.g. a target that was last set to 10 mL/min would
+                    # keep that rate when the source is 0.1 mL/min).
+                    run_on_main_thread(app, lambda p=panel: p.apply_settings_from_snapshot(snapshot))
                 if action_name == "apply":
                     panel.apply_settings_sync()
                     panel.after(0, lambda p=panel: p.set_status("Settings applied"))
