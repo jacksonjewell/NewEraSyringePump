@@ -3,7 +3,7 @@
   "recipes": [
     {
       "id": "00000000-0000-4000-8000-000000000001",
-      "name": "Example — settings only (no sequence)",
+      "name": "Example \u2014 settings only (no sequence)",
       "pump_labels": {
         "1": "Sample pump A",
         "2": "",
@@ -54,7 +54,7 @@
     },
     {
       "id": "00000000-0000-4000-8000-000000000002",
-      "name": "Example — with sequence",
+      "name": "Example \u2014 with sequence",
       "pump_labels": {
         "1": "",
         "2": "",
@@ -161,6 +161,174 @@
         {
           "type": "disconnect_pump",
           "pump": 1
+        }
+      ]
+    },
+    {
+      "id": "d97b60c4-bb4d-458c-8853-acce19e4fdbf",
+      "name": "Chip Prep",
+      "pump1": {
+        "syringe": "BD 10 mL (10 cc)",
+        "custom_diameter_mm": "14.50",
+        "rate_units": "mL/min",
+        "rate_value": "0.1",
+        "dispense_mode": "Continuous",
+        "volume_ul": "0",
+        "direction": "Infuse"
+      },
+      "pump2": {
+        "syringe": "BD 10 mL (10 cc)",
+        "custom_diameter_mm": "14.50",
+        "rate_units": "mL/min",
+        "rate_value": "0.1",
+        "dispense_mode": "Continuous",
+        "volume_ul": "0",
+        "direction": "Infuse"
+      },
+      "pump3": {
+        "syringe": "BD 10 mL (10 cc)",
+        "custom_diameter_mm": "14.50",
+        "rate_units": "mL/min",
+        "rate_value": "0.1",
+        "dispense_mode": "Continuous",
+        "volume_ul": "0",
+        "direction": "Infuse"
+      },
+      "pump1_conn": {
+        "com": "COM8",
+        "baud": 19200,
+        "address": 0
+      },
+      "pump2_conn": {
+        "com": "COM13",
+        "baud": 19200,
+        "address": 0
+      },
+      "pump3_conn": {
+        "com": "COM13",
+        "baud": 19200,
+        "address": 0
+      },
+      "pump_labels": {
+        "1": "Sample pump A",
+        "2": "",
+        "3": ""
+      },
+      "steps": [
+        {
+          "type": "connect_pump",
+          "pump": 1,
+          "com": "COM20",
+          "baud": 19200,
+          "address": 0
+        },
+        {
+          "type": "connect_pump",
+          "pump": 2,
+          "com": "COM17",
+          "baud": 19200,
+          "address": 0
+        },
+        {
+          "type": "connect_pump",
+          "pump": 3,
+          "com": "COM18",
+          "baud": 19200,
+          "address": 0
+        },
+        {
+          "type": "vacuum_connect",
+          "com": "COM6",
+          "baud": 9600
+        },
+        {
+          "type": "vacuum_on"
+        },
+        {
+          "type": "delay",
+          "seconds": 10.0
+        },
+        {
+          "type": "vacuum_off"
+        },
+        {
+          "type": "apply_pump",
+          "pump": 1,
+          "settings": {
+            "syringe": "BD 30 mL (30 cc)",
+            "custom_diameter_mm": "21.70",
+            "rate_units": "mL/min",
+            "rate_value": "1",
+            "dispense_mode": "Volume",
+            "volume_ul": "1000",
+            "direction": "Infuse"
+          }
+        },
+        {
+          "type": "apply_pump",
+          "pump": 2,
+          "settings": {
+            "syringe": "BD 30 mL (30 cc)",
+            "custom_diameter_mm": "21.70",
+            "rate_units": "mL/min",
+            "rate_value": "0.5",
+            "dispense_mode": "Continuous",
+            "volume_ul": "0",
+            "direction": "Infuse"
+          }
+        },
+        {
+          "type": "apply_pump",
+          "pump": 3,
+          "settings": {
+            "syringe": "BD 30 mL (30 cc)",
+            "custom_diameter_mm": "21.70",
+            "rate_units": "mL/min",
+            "rate_value": "1",
+            "dispense_mode": "Volume",
+            "volume_ul": "1000",
+            "direction": "Infuse"
+          }
+        },
+        {
+          "type": "line_check",
+          "pump": 1
+        },
+        {
+          "type": "run_pump",
+          "pump": 1
+        },
+        {
+          "type": "delay",
+          "seconds": 1.0
+        },
+        {
+          "type": "line_check",
+          "pump": 2
+        },
+        {
+          "type": "run_pump",
+          "pump": 2
+        },
+        {
+          "type": "delay",
+          "seconds": 5.0
+        },
+        {
+          "type": "stop_pump",
+          "pump": 2
+        },
+        {
+          "type": "line_check",
+          "pump": 3
+        },
+        {
+          "type": "run_pump",
+          "pump": 3
+        },
+        {
+          "type": "delay",
+          "seconds": 1.0
         }
       ]
     }

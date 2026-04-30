@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import copy
 import json
+import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -197,12 +199,66 @@ def run_on_main_thread(app: tk.Tk, fn: Callable[[], Any], timeout: float = 120.0
         finally:
             event.set()
 
-    app.after(0, wrapper)
+    _tk_safe_schedule(app, wrapper)
     if not event.wait(timeout=timeout):
         raise TimeoutError("GUI thread timed out")
     if err:
         raise err[0]
     return result[0] if result else None
+
+
+def _tk_safe_schedule(app: tk.Tk, fn: Callable[[], None]) -> None:
+    """Run *fn* on the Tk main thread (required for thread-safe GUI updates)."""
+    sched = getattr(app, "schedule_gui", None)
+    if callable(sched):
+        sched(fn)
+    else:
+        app.after(0, fn)
+
+
+class RecipeAbort(Exception):
+    """Raised when the recipe worker must stop (user aborted during a GUI wait)."""
+
+
+def run_on_main_thread_abortable(
+    app: tk.Tk,
+    fn: Callable[[], Any],
+    abort: threading.Event,
+    timeout: float = 120.0,
+) -> Any:
+    """Like ``run_on_main_thread`` but wakes periodically so *abort* can interrupt the wait."""
+    if abort.is_set():
+        raise RecipeAbort()
+    result: list[Any] = []
+    err: list[BaseException] = []
+    event = threading.Event()
+
+    def wrapper() -> None:
+        try:
+            if abort.is_set():
+                return
+            result.append(fn())
+        except BaseException as exc:
+            err.append(exc)
+        finally:
+            event.set()
+
+    _tk_safe_schedule(app, wrapper)
+    end = time.monotonic() + timeout
+    while not event.is_set():
+        if abort.is_set():
+            raise RecipeAbort()
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("GUI thread timed out")
+        event.wait(min(0.15, remaining))
+    if err:
+        raise err[0]
+    if abort.is_set():
+        raise RecipeAbort()
+    if not result:
+        return None
+    return result[0]
 
 
 def abortable_sleep(seconds: float, abort_event: threading.Event, chunk: float = 0.15) -> None:
@@ -216,6 +272,151 @@ def abortable_sleep(seconds: float, abort_event: threading.Event, chunk: float =
         if remaining <= 0:
             break
         time.sleep(min(chunk, remaining))
+
+
+def recipe_confirm_pump_line_open(
+    app: tk.Tk,
+    pump_index: int,
+    nicknames: dict[int, str],
+    abort: threading.Event,
+) -> bool:
+    """
+    Show a modal checkpoint on the main window **before** a pump run starts. The recipe worker
+    polls *abort* so **Abort recipe** works while the dialog is open. Returns False to stop the recipe.
+    """
+    nick = nicknames.get(pump_index) or f"Pump {pump_index}"
+    outcome: list[Optional[bool]] = [None]
+    dialog_holder: list[Optional[tk.Toplevel]] = [None]
+    t_open: list[Optional[float]] = [None]
+
+    def add_pause_time() -> None:
+        if t_open[0] is None:
+            return
+        dt = time.time() - t_open[0]
+        if hasattr(app, "_recipe_progress_pause_accum"):
+            app._recipe_progress_pause_accum += dt
+        t_open[0] = None
+
+    def refresh_progress() -> None:
+        fn = getattr(app, "_refresh_recipe_progress_after_checkpoint", None)
+        if callable(fn):
+            fn()
+
+    def build() -> None:
+        pf = getattr(app, "_progress_frame", None)
+        pl = getattr(app, "_progress_label", None)
+        if pf is not None and pl is not None:
+            try:
+                if pf.winfo_ismapped():
+                    pl.configure(
+                        text=f"Recipe paused — confirm Pump {pump_index} line is open, then tap Continue.",
+                    )
+            except tk.TclError:
+                pass
+        top = tk.Toplevel(app)
+        dialog_holder[0] = top
+        top.title("Line check")
+        top.transient(app)
+        top.resizable(False, False)
+        try:
+            dark = bool(getattr(app, "dark_mode", False))
+        except Exception:
+            dark = False
+        theme = DARK if dark else LIGHT
+        top.configure(bg=theme["bg"])
+        frm = tk.Frame(top, bg=theme["bg"], padx=18, pady=16)
+        frm.pack(fill="both", expand=True)
+        msg = (
+            f"Confirm pump {pump_index} line is open ({nick}).\n\n"
+            "Tap Continue when the line is ready."
+        )
+        tk.Label(
+            frm,
+            text=msg,
+            bg=theme["bg"],
+            fg=theme["fg"],
+            justify="left",
+            wraplength=420,
+        ).pack(anchor="w", pady=(0, 14))
+        btns = tk.Frame(frm, bg=theme["bg"])
+        btns.pack(fill="x")
+
+        def on_continue() -> None:
+            add_pause_time()
+            outcome[0] = True
+            try:
+                top.grab_release()
+            except tk.TclError:
+                pass
+            top.destroy()
+            dialog_holder[0] = None
+            refresh_progress()
+
+        def on_abort_click() -> None:
+            add_pause_time()
+            abort.set()
+            outcome[0] = False
+            try:
+                top.grab_release()
+            except tk.TclError:
+                pass
+            top.destroy()
+            dialog_holder[0] = None
+            refresh_progress()
+
+        top.protocol("WM_DELETE_WINDOW", on_abort_click)
+        tk.Button(
+            btns,
+            text="Continue",
+            command=on_continue,
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        ).pack(side="left", padx=(0, 8))
+        tk.Button(
+            btns,
+            text="Abort recipe",
+            command=on_abort_click,
+            padx=14,
+            pady=6,
+            cursor="hand2",
+        ).pack(side="left")
+        top.update_idletasks()
+        t_open[0] = time.time()
+        top.grab_set()
+        top.focus_force()
+        top.lift()
+
+    _tk_safe_schedule(app, build)
+    while outcome[0] is None:
+        if abort.is_set():
+            outcome[0] = False
+
+            def destroy_dialog() -> None:
+                d = dialog_holder[0]
+                if d is None:
+                    return
+                try:
+                    d.grab_release()
+                except tk.TclError:
+                    pass
+                try:
+                    if d.winfo_exists():
+                        d.destroy()
+                except tk.TclError:
+                    pass
+                dialog_holder[0] = None
+
+            _tk_safe_schedule(app, destroy_dialog)
+            if t_open[0] is not None and hasattr(app, "_recipe_progress_pause_accum"):
+                app._recipe_progress_pause_accum += time.time() - t_open[0]
+                t_open[0] = None
+            _tk_safe_schedule(app, refresh_progress)
+            return False
+        time.sleep(0.05)
+    if outcome[0] is not True:
+        return False
+    return not abort.is_set()
 
 
 def recipe_display_name(recipe: dict[str, Any]) -> str:
@@ -258,6 +459,8 @@ def format_step_summary(step: dict[str, Any], nicknames: Optional[dict[int, str]
         return f"Apply {_pump_step_name(step.get('pump'), nicknames)} — {sy}, {rv} {ru}, {dm}"
     if t == "run_pump":
         return f"Run {_pump_step_name(step.get('pump'), nicknames)}"
+    if t == "line_check":
+        return f"Confirm line open — {_pump_step_name(step.get('pump'), nicknames)}"
     if t == "stop_pump":
         return f"Stop {_pump_step_name(step.get('pump'), nicknames)}"
     if t == "vacuum_connect":
@@ -332,7 +535,7 @@ def _recipe_resources(recipe: dict[str, Any]) -> tuple[set[int], bool]:
             if not isinstance(step, dict):
                 continue
             t = step.get("type", "")
-            if t in ("connect_pump", "disconnect_pump", "apply_pump", "run_pump", "stop_pump"):
+            if t in ("connect_pump", "disconnect_pump", "apply_pump", "run_pump", "stop_pump", "line_check"):
                 try:
                     pumps_used.add(int(step["pump"]))
                 except (KeyError, ValueError, TypeError):
@@ -359,7 +562,7 @@ def _friendly_step_error(step: dict[str, Any], step_index: int, error_msg: str, 
         "Suggestion:",
     ]
     low = error_msg.lower()
-    if t in ("connect_pump", "apply_pump", "run_pump", "stop_pump"):
+    if t in ("connect_pump", "apply_pump", "run_pump", "stop_pump", "line_check"):
         pnum = step.get("pump", "?")
         if "could not open port" in low or "denied" in low or "filenotfounderror" in low:
             lines.append(f"  - Check that pump {pnum}'s USB cable is plugged in and the COM port is correct.")
@@ -965,9 +1168,33 @@ class PumpPanel(ttk.LabelFrame):
         pump.run(wait_while_running=False)
         self.run_start_ts = time.time()
 
+    def run_sync_for_recipe(self, abort: Optional[threading.Event] = None) -> bool:
+        """
+        Used by recipe runners only. In **Volume** mode, blocks until the pump finishes the
+        programmed dispense (or until *abort*). In **Continuous** mode, starts the pump and returns
+        immediately (add a ``stop_pump`` step or delay before other pumps if you need ordering).
+        Returns False if *abort* stopped the run.
+        """
+        pump = self._require_pump()
+        poll = Pump.PUMPING_POLL_DELAY
+        if self.dispense_mode_var.get() == "Volume":
+            pump.run(wait_while_running=False)
+            self.run_start_ts = time.time()
+            while pump.running:
+                if abort is not None and abort.is_set():
+                    pump.stop(wait_while_running=True)
+                    self.run_start_ts = None
+                    return False
+                time.sleep(poll)
+            self.run_start_ts = None
+        else:
+            pump.run(wait_while_running=False)
+            self.run_start_ts = time.time()
+        return True
+
     def stop_sync(self) -> None:
         pump = self._require_pump()
-        pump.stop(wait_while_running=False)
+        pump.stop(wait_while_running=True)
         self.run_start_ts = None
 
     def read_status_sync(self) -> None:
@@ -1035,17 +1262,29 @@ class PumpPanel(ttk.LabelFrame):
         self.time_sec_var.set(str(elapsed))
 
 
+_VACUUM_LINE_RE = re.compile(
+    r"VACUUM_KPA:\s*([-+]?\d+(?:\.\d+)?)\s*,\s*INHG:\s*([-+]?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+
 class VacuumPanel(ttk.LabelFrame):
     """Vacuum control using an Arduino serial command (1/0)."""
 
     def __init__(self, master: tk.Widget, ports: list[str]) -> None:
         super().__init__(master, text="Vacuum Control", padding=10)
+        self._serial_lock = threading.Lock()
         self.serial_conn: Optional[serial.Serial] = None
         self.connected_com: Optional[str] = None
         self.connected_since_ts: Optional[float] = None
         self.is_on = False
         self._vacuum_blink_after_id: Optional[Any] = None
         self._vacuum_blink_phase = False
+        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_stop = threading.Event()
+        self.latest_kpa: Optional[float] = None
+        self.latest_inhg: Optional[float] = None
+        self.latest_bar: Optional[float] = None
         self._build(ports)
 
     def _build(self, ports: list[str]) -> None:
@@ -1093,6 +1332,22 @@ class VacuumPanel(ttk.LabelFrame):
 
         self.reply_var = tk.StringVar(value="Arduino reply: (none)")
         ttk.Label(self, textvariable=self.reply_var).grid(row=7, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        self.bar_var = tk.StringVar(value="Vacuum: --- bar")
+        ttk.Label(self, textvariable=self.bar_var, font=("Segoe UI", 12, "bold")).grid(
+            row=8, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
+        self.kpa_var = tk.StringVar(value="Vacuum: --- kPa")
+        ttk.Label(self, textvariable=self.kpa_var, font=("Segoe UI", 11, "bold")).grid(
+            row=9, column=0, columnspan=2, sticky="w", pady=(2, 0)
+        )
+
+        self.inhg_var = tk.StringVar(value="Vacuum: --- inHg")
+        ttk.Label(self, textvariable=self.inhg_var, font=("Segoe UI", 11, "bold")).grid(
+            row=10, column=0, columnspan=2, sticky="w", pady=(2, 0)
+        )
+
         self.columnconfigure(1, weight=1)
 
     def update_port_choices(self, ports: list[str]) -> None:
@@ -1151,6 +1406,79 @@ class VacuumPanel(ttk.LabelFrame):
     def _set_reply(self, text: str) -> None:
         self.reply_var.set(f"Arduino reply: {text}")
 
+    def _set_vacuum_readout(self, kpa: Optional[float], inhg: Optional[float]) -> None:
+        bar = -kpa / 100.0 if kpa is not None else None
+        self.latest_kpa = kpa
+        self.latest_inhg = inhg
+        self.latest_bar = bar
+        self.bar_var.set(
+            f"Vacuum: {bar:+.2f} bar" if bar is not None else "Vacuum: --- bar"
+        )
+        self.kpa_var.set(
+            f"Vacuum: {kpa:.2f} kPa" if kpa is not None else "Vacuum: --- kPa"
+        )
+        self.inhg_var.set(
+            f"Vacuum: {inhg:.2f} inHg" if inhg is not None else "Vacuum: --- inHg"
+        )
+
+    def _handle_serial_line(self, line: str) -> None:
+        """Dispatch a single decoded line from the Arduino on the Tk main thread."""
+        if not line:
+            return
+        match = _VACUUM_LINE_RE.search(line)
+        if match:
+            try:
+                kpa = float(match.group(1))
+                inhg = float(match.group(2))
+            except ValueError:
+                return
+            self._set_vacuum_readout(kpa, inhg)
+            return
+        self._set_reply(line)
+
+    def _reader_loop(self, conn: serial.Serial) -> None:
+        """Continuously read newline-terminated lines from ``conn`` until stopped."""
+        while not self._reader_stop.is_set():
+            try:
+                if not conn.is_open:
+                    break
+                raw = conn.readline()
+            except (serial.SerialException, OSError):
+                self.after(0, lambda: self._set_reply("(disconnected)"))
+                self.after(0, lambda: self._set_vacuum_readout(None, None))
+                break
+            except Exception:
+                break
+            if self._reader_stop.is_set():
+                break
+            if not raw:
+                continue
+            try:
+                line = raw.decode("utf-8", errors="ignore").strip()
+            except Exception:
+                continue
+            if not line:
+                continue
+            self.after(0, lambda l=line: self._handle_serial_line(l))
+
+    def _start_reader_thread(self, conn: serial.Serial) -> None:
+        existing = self._reader_thread
+        if existing is not None and existing.is_alive():
+            return
+        self._reader_stop.clear()
+        thread = threading.Thread(
+            target=self._reader_loop, args=(conn,), daemon=True, name="VacuumSerialReader"
+        )
+        self._reader_thread = thread
+        thread.start()
+
+    def _stop_reader_thread(self) -> None:
+        self._reader_stop.set()
+        thread = self._reader_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=1.5)
+        self._reader_thread = None
+
     def _startup_delay_seconds(self) -> float:
         delay = float(self.startup_delay_var.get().strip())
         if delay < 0:
@@ -1179,9 +1507,12 @@ class VacuumPanel(ttk.LabelFrame):
         self.connected_com = com_name
         self.connected_since_ts = time.time()
         self._set_conn_status(f"Arduino: Connected on {com_name} @ 9600")
+        self.after(0, lambda: self._set_vacuum_readout(0.0, 0.0))
+        self._start_reader_thread(self.serial_conn)
         return self.serial_conn
 
     def _close_serial(self) -> None:
+        self._stop_reader_thread()
         if self.serial_conn is not None:
             try:
                 self.serial_conn.close()
@@ -1191,63 +1522,52 @@ class VacuumPanel(ttk.LabelFrame):
         self.connected_com = None
         self.connected_since_ts = None
         self._set_conn_status("Arduino: Disconnected")
+        self.after(0, lambda: self._set_vacuum_readout(None, None))
 
     def open_serial_explicit(self, com: str, baud: int = 9600) -> None:
         """Open vacuum serial on ``com`` (for recipe runner; does not require com_var yet)."""
-        self._close_serial()
-        self.serial_conn = serial.Serial(port=com, baudrate=baud, timeout=1)
-        self.connected_com = com
-        self.connected_since_ts = time.time()
+        with self._serial_lock:
+            self._close_serial()
+            self.serial_conn = serial.Serial(port=com, baudrate=baud, timeout=1)
+            self.connected_com = com
+            self.connected_since_ts = time.time()
+            self._start_reader_thread(self.serial_conn)
         self.after(0, lambda c=com: self.com_var.set(c))
         self.after(0, lambda c=com: self._set_conn_status(f"Arduino: Connected on {c} @ {baud}"))
+        self.after(0, lambda: self._set_vacuum_readout(0.0, 0.0))
 
     def close_serial_sync(self) -> None:
-        self._close_serial()
-        self.is_on = False
+        with self._serial_lock:
+            self._close_serial()
+            self.is_on = False
         self.after(0, lambda: self.toggle_btn.config(text="Tap ON"))
         self.after(0, self._set_button_color)
         self.after(0, lambda: self._set_status("Vacuum OFF"))
         self.after(0, lambda: self._set_reply("(none)"))
 
     def send_vacuum_sync(self, on: bool) -> None:
-        conn = self._ensure_connected()
-        self._wait_until_ready()
-        conn.write(("1" if on else "0").encode("ascii"))
-        conn.flush()
-        self.is_on = on
+        with self._serial_lock:
+            conn = self._ensure_connected()
+            self._wait_until_ready()
+            conn.write(("1" if on else "0").encode("ascii"))
+            conn.flush()
+            self.is_on = on
         self.after(0, lambda o=on: self.toggle_btn.config(text="Tap OFF" if o else "Tap ON"))
         self.after(0, self._set_button_color)
         self.after(0, lambda o=on: self._set_status("Vacuum ON (recipe)" if o else "Vacuum OFF (recipe)"))
 
     def _send_value(self, value: str) -> None:
-        conn = self._ensure_connected()
-        self._wait_until_ready()
-        conn.write(value.encode("ascii"))
-        conn.flush()
-        self._read_reply_async()
-
-    def _read_reply_async(self) -> None:
-        conn = self.serial_conn
-        if conn is None or not conn.is_open:
-            return
-
-        def work() -> None:
-            try:
-                time.sleep(0.08)
-                line = conn.readline().decode("utf-8", errors="ignore").strip()
-                if line:
-                    self.after(0, lambda: self._set_reply(line))
-            except Exception:
-                pass
-
-        threading.Thread(target=work, daemon=True).start()
+        with self._serial_lock:
+            conn = self._ensure_connected()
+            self._wait_until_ready()
+            conn.write(value.encode("ascii"))
+            conn.flush()
 
     def connect_arduino(self) -> None:
         def work() -> None:
-            conn = self._ensure_connected()
-            self._wait_until_ready()
-            if conn.in_waiting:
-                _ = conn.read(conn.in_waiting)
+            with self._serial_lock:
+                self._ensure_connected()
+                self._wait_until_ready()
             self.after(0, lambda: self._set_status("Arduino connected and ready"))
             self.after(0, lambda: self._set_reply("ready"))
 
@@ -1255,8 +1575,9 @@ class VacuumPanel(ttk.LabelFrame):
 
     def disconnect_arduino(self) -> None:
         def work() -> None:
-            self._close_serial()
-            self.is_on = False
+            with self._serial_lock:
+                self._close_serial()
+                self.is_on = False
             self.after(0, lambda: self.toggle_btn.config(text="Tap ON"))
             self.after(0, self._set_button_color)
             self.after(0, lambda: self._set_status("Vacuum OFF"))
@@ -1288,9 +1609,15 @@ class VacuumPanel(ttk.LabelFrame):
     def force_off(self) -> None:
         def work() -> None:
             try:
-                if self.is_on:
-                    self._send_value("0")
-                self.is_on = False
+                with self._serial_lock:
+                    conn = self.serial_conn
+                    if conn is not None and getattr(conn, "is_open", False):
+                        try:
+                            conn.write(b"0")
+                            conn.flush()
+                        except Exception:
+                            pass
+                    self.is_on = False
                 self.after(0, lambda: self.toggle_btn.config(text="Tap ON"))
                 self.after(0, self._set_button_color)
                 self.after(0, lambda: self._set_status("Vacuum OFF (forced)"))
@@ -1388,6 +1715,7 @@ class RecipeSequenceEditor(tk.Toplevel):
         row2 = ttk.Frame(add_fr)
         row2.pack(fill="x")
         ttk.Button(row2, text="Run pump…", command=self._add_run_pump).pack(side="left", padx=(0, 4), pady=2)
+        ttk.Button(row2, text="Confirm line…", command=self._add_line_check).pack(side="left", padx=(0, 4), pady=2)
         ttk.Button(row2, text="Stop pump…", command=self._add_stop_pump).pack(side="left", padx=(0, 4), pady=2)
         ttk.Button(row2, text="Vacuum connect…", command=self._add_vacuum_connect).pack(side="left", padx=(0, 4), pady=2)
         ttk.Button(row2, text="Vacuum disconnect", command=self._add_vacuum_disconnect).pack(side="left", padx=(0, 4), pady=2)
@@ -1569,6 +1897,22 @@ class RecipeSequenceEditor(tk.Toplevel):
             )
             if p is not None:
                 self._commit_step(index, {"type": "run_pump", "pump": int(p)})
+        elif t == "line_check":
+            try:
+                cur_p = int(st.get("pump", 1))
+            except (TypeError, ValueError):
+                cur_p = 1
+            cur_p = max(1, min(3, cur_p))
+            p = simpledialog.askinteger(
+                "Confirm line",
+                "Pump number (1–3) for line check:",
+                parent=self,
+                minvalue=1,
+                maxvalue=3,
+                initialvalue=cur_p,
+            )
+            if p is not None:
+                self._commit_step(index, {"type": "line_check", "pump": int(p)})
         elif t == "stop_pump":
             try:
                 cur_p = int(st.get("pump", 1))
@@ -1895,6 +2239,17 @@ class RecipeSequenceEditor(tk.Toplevel):
         if p is not None:
             self._push_step({"type": "run_pump", "pump": int(p)})
 
+    def _add_line_check(self) -> None:
+        p = simpledialog.askinteger(
+            "Confirm line",
+            "Pump number (1–3) — pause until operator confirms that line is open:",
+            parent=self,
+            minvalue=1,
+            maxvalue=3,
+        )
+        if p is not None:
+            self._push_step({"type": "line_check", "pump": int(p)})
+
     def _add_stop_pump(self) -> None:
         p = simpledialog.askinteger("Stop pump", "Pump number (1–3):", parent=self, minvalue=1, maxvalue=3)
         if p is not None:
@@ -2192,6 +2547,11 @@ class PumpControllerApp(tk.Tk):
         self._quick_recipe_var = tk.StringVar(value="")
         self._recipe_abort_event = threading.Event()
         self._recipe_thread_running = False
+        self._active_recipe_name: str = ""
+        self._active_recipe_from_toolbar: bool = False
+        self._recipe_gui_queue: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+        self._recipe_gui_poll_after: Optional[str] = None
+        self._abort_reinit_after: Optional[str] = None
         self._run_recipe_blink_after: Optional[str] = None
         self._quick_recipe_combo: Optional[ttk.Combobox] = None
         self._run_recipe_btn: Optional[tk.Button] = None
@@ -2303,6 +2663,7 @@ class PumpControllerApp(tk.Tk):
         self._progress_start_time: float = 0.0
         self._progress_total_time: float = 0.0
         self._progress_tick_id: Optional[str] = None
+        self._recipe_progress_pause_accum: float = 0.0
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_quick_recipe_combo()
@@ -2344,23 +2705,50 @@ class PumpControllerApp(tk.Tk):
         if self._body_frame is not None and not self._body_frame.winfo_ismapped():
             self._body_frame.pack(after=self._header_frame, fill="both", expand=True)
 
-    def _show_progress_bar(self, total_seconds: float) -> None:
+    def _show_progress_bar(self, total_seconds: float, *, unknown_duration: bool = False) -> None:
+        self._recipe_progress_pause_accum = 0.0
+        self._progress_unknown_duration = unknown_duration
         self._progress_total_time = max(total_seconds, 0.1)
         self._progress_start_time = time.time()
         self._progress_bar.configure(maximum=100, value=0)
-        self._progress_label.configure(text=f"Recipe running \u2014 0% (est. {_format_duration(total_seconds)})")
+        if unknown_duration:
+            self._progress_label.configure(
+                text="Recipe running \u2014 0% (approximate timeline; valve checks pause the bar)",
+            )
+        else:
+            self._progress_label.configure(text=f"Recipe running \u2014 0% (est. {_format_duration(total_seconds)})")
         self._progress_frame.pack(side="right")
         self._progress_tick()
 
     def _progress_tick(self) -> None:
         if not self._recipe_thread_running:
             return
-        elapsed = time.time() - self._progress_start_time
+        elapsed = max(
+            0.0,
+            time.time() - self._progress_start_time - self._recipe_progress_pause_accum,
+        )
         pct = min(100.0, (elapsed / self._progress_total_time) * 100.0)
         remaining = max(0.0, self._progress_total_time - elapsed)
         self._progress_bar.configure(value=pct)
-        self._progress_label.configure(text=f"Recipe running \u2014 {pct:.0f}%  ({_format_duration(remaining)} remaining)")
+        if getattr(self, "_progress_unknown_duration", False):
+            self._progress_label.configure(text=f"Recipe running \u2014 {pct:.0f}%  (approx.)")
+        else:
+            self._progress_label.configure(
+                text=f"Recipe running \u2014 {pct:.0f}%  ({_format_duration(remaining)} remaining)",
+            )
         self._progress_tick_id = self.after(500, self._progress_tick)
+
+    def _refresh_recipe_progress_after_checkpoint(self) -> None:
+        """Resync bar/label after a blocking valve checkpoint (main thread only)."""
+        if not self._recipe_thread_running:
+            return
+        if self._progress_tick_id is not None:
+            try:
+                self.after_cancel(self._progress_tick_id)
+            except tk.TclError:
+                pass
+            self._progress_tick_id = None
+        self._progress_tick()
 
     def _hide_progress_bar(self) -> None:
         if self._progress_tick_id is not None:
@@ -2369,6 +2757,7 @@ class PumpControllerApp(tk.Tk):
             except tk.TclError:
                 pass
             self._progress_tick_id = None
+        self._recipe_progress_pause_accum = 0.0
         self._progress_frame.pack_forget()
 
     def _preflight_check(self, recipe: dict[str, Any]) -> Optional[str]:
@@ -2508,9 +2897,115 @@ class PumpControllerApp(tk.Tk):
         rec = recipes[idx]
         self._confirm_and_run_recipe(rec, from_toolbar=True)
 
+    def schedule_gui(self, fn: Callable[[], None]) -> None:
+        """Queue *fn* to run on the Tk main thread (safe from recipe worker threads)."""
+        self._recipe_gui_queue.put(fn)
+
+    def _drain_and_stop_recipe_gui_queue(self) -> None:
+        if self._recipe_gui_poll_after is not None:
+            try:
+                self.after_cancel(self._recipe_gui_poll_after)
+            except tk.TclError:
+                pass
+            self._recipe_gui_poll_after = None
+        while True:
+            try:
+                self._recipe_gui_queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _recipe_gui_poll_tick(self) -> None:
+        self._recipe_gui_poll_after = None
+        try:
+            while True:
+                fn = self._recipe_gui_queue.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        if self._recipe_thread_running:
+            self._recipe_gui_poll_after = self.after(20, self._recipe_gui_poll_tick)
+
+    def _start_recipe_gui_poll(self) -> None:
+        self._drain_and_stop_recipe_gui_queue()
+        self._recipe_gui_poll_tick()
+
     def abort_recipe_run(self) -> None:
-        """Signal the background recipe worker to stop between steps (and during delays)."""
+        """Stop the recipe UI immediately, signal the worker, stop pumps/vacuum, then reinitialize."""
+        if not self._recipe_thread_running:
+            return
         self._recipe_abort_event.set()
+        name = self._active_recipe_name
+        ftb = self._active_recipe_from_toolbar
+        vp = self.vacuum_panel
+        if vp is not None:
+            vp._stop_vacuum_blink()
+            vp.is_on = False
+            try:
+                vp.toggle_btn.config(text="Tap ON")
+            except tk.TclError:
+                pass
+            try:
+                vp._set_button_color()
+            except tk.TclError:
+                pass
+            vp._set_status("Vacuum OFF (recipe aborted)")
+        self._finish_recipe_run(ftb, name, user_aborted=True, had_error=False)
+        threading.Thread(target=self._abort_stop_hardware_motion, daemon=True).start()
+        if self._abort_reinit_after is not None:
+            try:
+                self.after_cancel(self._abort_reinit_after)
+            except tk.TclError:
+                pass
+            self._abort_reinit_after = None
+        self._abort_reinit_after = self.after(200, self._reinitialize_after_abort)
+
+    def _abort_stop_hardware_motion(self) -> None:
+        """Best-effort stop syringe pumps and send vacuum OFF (runs on a background thread)."""
+        for panel in self.panels:
+            if panel.connection.pump is None:
+                continue
+            try:
+                panel.stop_sync()
+            except Exception:
+                pass
+        vp = self.vacuum_panel
+        if vp is None:
+            return
+        try:
+            with vp._serial_lock:
+                conn = vp.serial_conn
+                if conn is not None and getattr(conn, "is_open", False):
+                    try:
+                        conn.write(b"0")
+                        conn.flush()
+                    except Exception:
+                        pass
+                vp.is_on = False
+        except Exception:
+            pass
+
+    def _reinitialize_after_abort(self) -> None:
+        """Disconnect pumps and vacuum on the main thread after an abort (fresh \"not connected\" state)."""
+        self._abort_reinit_after = None
+        if self._recipe_thread_running:
+            return
+        for panel in self.panels:
+            try:
+                panel.disconnect_sync()
+            except Exception:
+                pass
+            try:
+                panel.set_status("Aborted — use Connect or Reinitialize")
+            except tk.TclError:
+                pass
+        if self.vacuum_panel is not None:
+            try:
+                self.vacuum_panel.close_serial_sync()
+            except Exception:
+                pass
 
     def _start_run_recipe_blink(self) -> None:
         self._stop_run_recipe_blink()
@@ -2540,20 +3035,46 @@ class PumpControllerApp(tk.Tk):
             theme = DARK if self.dark_mode else LIGHT
             self._run_recipe_btn.configure(bg=theme["btn"], fg=theme["fg"], activebackground=theme["btn_hover"])
 
-    def _finish_recipe_run(self, from_toolbar: bool, recipe_name: str = "", aborted: bool = False) -> None:
+    def _finish_recipe_run(
+        self,
+        from_toolbar: bool,
+        recipe_name: str = "",
+        *,
+        user_aborted: bool = False,
+        had_error: bool = False,
+    ) -> None:
+        self._drain_and_stop_recipe_gui_queue()
         self._recipe_thread_running = False
-        self._recipe_abort_event.clear()
+        self._active_recipe_name = ""
+        # Abort flag is cleared only when a new recipe starts (_begin_recipe_run) so the worker
+        # can still see abort.is_set() until it exits after a toolbar abort.
         if from_toolbar:
             self._stop_run_recipe_blink()
         if self._abort_recipe_btn is not None and self._abort_recipe_btn.winfo_exists():
             self._abort_recipe_btn.configure(state="disabled")
         self._hide_progress_bar()
-        if recipe_name and not aborted:
-            messagebox.showinfo("Recipe Complete", f'Recipe "{recipe_name}" Complete', parent=self)
+        if recipe_name:
+            if had_error:
+                pass
+            elif user_aborted:
+                messagebox.showinfo(
+                    "Recipe aborted",
+                    f'Recipe "{recipe_name}" was stopped.',
+                    parent=self,
+                )
+            else:
+                messagebox.showinfo("Recipe Complete", f'Recipe "{recipe_name}" Complete', parent=self)
 
     def _begin_recipe_run(self, from_toolbar: bool) -> None:
+        if self._abort_reinit_after is not None:
+            try:
+                self.after_cancel(self._abort_reinit_after)
+            except tk.TclError:
+                pass
+            self._abort_reinit_after = None
         self._recipe_abort_event.clear()
         self._recipe_thread_running = True
+        self._start_recipe_gui_poll()
         if self._abort_recipe_btn is not None:
             self._abort_recipe_btn.configure(state="normal")
         if from_toolbar:
@@ -2621,9 +3142,14 @@ class PumpControllerApp(tk.Tk):
 
         recipe_name = recipe.get("name", "")
         est = _estimate_recipe_time(recipe)
+        self._active_recipe_name = recipe_name
+        self._active_recipe_from_toolbar = from_toolbar
         self._begin_recipe_run(from_toolbar)
+        # Always show the bar for sequences (toolbar + Recipes window) so valve checkpoints can pause the clock.
         if est > 0:
             self._show_progress_bar(est)
+        else:
+            self._show_progress_bar(180.0, unknown_duration=True)
         abort = self._recipe_abort_event
         app = self
         nicks = self.pump_nickname_map()
@@ -2663,7 +3189,7 @@ class PumpControllerApp(tk.Tk):
                             if abort.is_set():
                                 was_aborted = True
                                 return
-                            run_on_main_thread(app, set_p_fields)
+                            run_on_main_thread_abortable(app, set_p_fields, abort)
                             if abort.is_set():
                                 was_aborted = True
                                 return
@@ -2684,11 +3210,24 @@ class PumpControllerApp(tk.Tk):
                             if abort.is_set():
                                 was_aborted = True
                                 return
-                            run_on_main_thread(app, apply_u)
+                            run_on_main_thread_abortable(app, apply_u, abort)
                             if abort.is_set():
                                 was_aborted = True
                                 return
                             panel.apply_settings_sync()
+                        elif st == "line_check":
+                            p = int(step["pump"])
+                            if p not in (1, 2, 3):
+                                raise ValueError(f"Invalid pump {p}")
+                            if abort.is_set():
+                                was_aborted = True
+                                return
+                            if not recipe_confirm_pump_line_open(app, p, nicks, abort):
+                                was_aborted = True
+                                return
+                            if abort.is_set():
+                                was_aborted = True
+                                return
                         elif st == "run_pump":
                             p = int(step["pump"])
                             panel = app.panels[p - 1]
@@ -2699,7 +3238,9 @@ class PumpControllerApp(tk.Tk):
                             if abort.is_set():
                                 was_aborted = True
                                 return
-                            panel.run_sync()
+                            if not panel.run_sync_for_recipe(abort):
+                                was_aborted = True
+                                return
                         elif st == "stop_pump":
                             p = int(step["pump"])
                             app.panels[p - 1].stop_sync()
@@ -2715,7 +3256,7 @@ class PumpControllerApp(tk.Tk):
                             if abort.is_set():
                                 was_aborted = True
                                 return
-                            run_on_main_thread(app, set_v)
+                            run_on_main_thread_abortable(app, set_v, abort)
                             if abort.is_set():
                                 was_aborted = True
                                 return
@@ -2734,16 +3275,28 @@ class PumpControllerApp(tk.Tk):
                             vac.send_vacuum_sync(False)
                         else:
                             raise ValueError(f"Unknown step type: {st}")
+                    except RecipeAbort:
+                        was_aborted = True
+                        return
                     except Exception as exc:
                         had_error = True
                         detail = _friendly_step_error(step, idx, str(exc), nicks)
-                        app.after(
-                            0,
+                        app.schedule_gui(
                             lambda d=detail: messagebox.showerror("Recipe Failed", d, parent=app),
                         )
                         return
             finally:
-                app.after(0, lambda ftb=from_toolbar, rn=recipe_name, ab=(was_aborted or had_error): app._finish_recipe_run(ftb, recipe_name=rn, aborted=ab))
+                def _fin_seq() -> None:
+                    if not app._recipe_thread_running:
+                        return
+                    app._finish_recipe_run(
+                        from_toolbar,
+                        recipe_name,
+                        user_aborted=was_aborted,
+                        had_error=had_error,
+                    )
+
+                app.schedule_gui(_fin_seq)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2754,8 +3307,15 @@ class PumpControllerApp(tk.Tk):
             return
 
         recipe_name = recipe.get("name", "")
+        self._active_recipe_name = recipe_name
+        self._active_recipe_from_toolbar = from_toolbar
         self._begin_recipe_run(from_toolbar)
         self.apply_recipe_to_panels(recipe)
+        est_simple = _estimate_recipe_time(recipe)
+        if est_simple > 0:
+            self._show_progress_bar(est_simple)
+        else:
+            self._show_progress_bar(180.0, unknown_duration=True)
         abort = self._recipe_abort_event
         app = self
 
@@ -2769,23 +3329,32 @@ class PumpControllerApp(tk.Tk):
                         was_aborted = True
                         return
                     if panel.connection.pump is None:
-                        panel.after(0, lambda p=panel: p.set_status("Recipe: not connected \u2014 skipped"))
+                        app.schedule_gui(
+                            lambda p=panel: p.set_status("Recipe: not connected \u2014 skipped"),
+                        )
                         continue
                     try:
                         panel.apply_settings_sync()
                         if abort.is_set():
                             was_aborted = True
                             return
-                        panel.run_sync()
+                        if not panel.run_sync_for_recipe(abort):
+                            was_aborted = True
+                            return
                         any_ran = True
-                        panel.after(0, lambda p=panel: p.set_status("Running (recipe)"))
+                        app.schedule_gui(
+                            lambda p=panel: p.set_status(
+                                "Recipe: volume dispense finished"
+                                if p.dispense_mode_var.get() == "Volume"
+                                else "Running (recipe)"
+                            ),
+                        )
                     except Exception as exc:
                         had_error = True
                         msg = str(exc)
-                        panel.after(0, lambda p=panel, m=msg: p.set_status(f"Recipe error: {m}"))
+                        app.schedule_gui(lambda p=panel, m=msg: p.set_status(f"Recipe error: {m}"))
                 if not any_ran and not had_error and not was_aborted:
-                    app.after(
-                        0,
+                    app.schedule_gui(
                         lambda rn=recipe_name: messagebox.showerror(
                             "Recipe Failed",
                             f'Recipe "{rn}" could not run.\n\nNo pumps were connected. Connect the required pumps and try again.',
@@ -2794,7 +3363,17 @@ class PumpControllerApp(tk.Tk):
                     )
                     had_error = True
             finally:
-                app.after(0, lambda ftb=from_toolbar, rn=recipe_name, ab=(was_aborted or had_error): app._finish_recipe_run(ftb, recipe_name=rn, aborted=ab))
+                def _fin_simple() -> None:
+                    if not app._recipe_thread_running:
+                        return
+                    app._finish_recipe_run(
+                        from_toolbar,
+                        recipe_name,
+                        user_aborted=was_aborted,
+                        had_error=had_error,
+                    )
+
+                app.schedule_gui(_fin_simple)
 
         threading.Thread(target=work, daemon=True).start()
 

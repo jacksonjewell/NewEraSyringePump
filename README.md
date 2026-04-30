@@ -18,6 +18,12 @@ Built for the Wanunu Lab at Northeastern University.
 - **Dark / Light mode** toggle
 - **Styled action buttons**: **Pump Auto-Connect** and **Apply Settings** (yellow) share a row; **Run** (green) and **Stop** (red) share a row below. All action buttons illuminate on hover.
 - **Arduino vacuum panel**: connect to Arduino Uno, toggle vacuum ON/OFF via serial (sends `1`/`0`), displays Arduino reply. Toggle button is **orange when OFF** and **blinking blue when ON**.
+- **Live vacuum readout (MPX5100DP)**: while the Arduino is connected, the panel continuously displays the current vacuum level at ~10 Hz in three units:
+  - **bar** (signed, e.g. `+0.00 bar` at rest, `-0.80 bar` under vacuum) — shown in the largest bold label
+  - **kPa** — magnitude of vacuum below atmosphere (0–100 kPa)
+  - **inHg** — same value converted to inches of mercury
+
+  Readouts initialize to `0.00` the moment the Arduino connects, update continuously regardless of motor state (so you can monitor whether captured vacuum holds after the pump shuts off), and reset to `---` only on disconnect. The serial reader runs in a background thread so the GUI stays responsive, and gracefully recovers from disconnects or malformed lines.
 - **Manual COM port entry**: develop and configure without hardware connected
 - **Recipe confirmation**: before running, a summary dialog shows pumps used, vacuum requirement, step list, and estimated run time. A **preflight check** verifies all hardware is connected; if not, a detailed error explains what's missing with suggestions to fix it.
 - **Progress bar**: during recipe execution, a progress bar in the bottom-right shows estimated completion percentage and time remaining.
@@ -131,12 +137,27 @@ The committed file **`recipes.example.json`** contains two recipes: one **withou
 
 The sketch is in the repo at **`arduino/VacuumPumpV1/VacuumPumpV1.ino`** (Arduino IDE expects the folder name to match the `.ino` filename). Open that folder in Arduino IDE and upload to an Uno.
 
-The sketch listens at **9600** baud and accepts:
+**Wiring (Arduino Uno):**
 
-- `1` — motor + LED ON
-- `0` — motor + LED OFF
+- Vacuum motor relay/transistor signal → **D9**
+- Indicator LED (in series with ~220 Ω resistor) → **D3**, cathode → GND
+- **MPX5100DP** pressure sensor signal → **A0**, sensor `Vs` → 5 V, `GND` → GND
+- Sensor port: connect one port to the vacuum line; leave the other open to atmosphere (so it reads the differential)
 
-The GUI's Vacuum Control panel connects to the Arduino's COM port and sends these commands via the toggle button.
+**Serial protocol (9600 baud):**
+
+Commands the GUI sends to the Arduino:
+
+- `1` — motor + LED ON, Arduino replies `MOTOR:ON`
+- `0` — motor + LED OFF, Arduino replies `MOTOR:OFF`
+
+Telemetry the Arduino streams continuously (~10 Hz, always while connected):
+
+```
+VACUUM_KPA:<kpa>,INHG:<inhg>
+```
+
+The GUI's Vacuum Control panel listens for these lines and updates the **bar / kPa / inHg** readouts live. The conversion to bar (for the signed "vacuum gauge" display) is `bar = -kPa / 100`, so 80 kPa of vacuum reads as `-0.80 bar`.
 
 ## Project Structure
 
