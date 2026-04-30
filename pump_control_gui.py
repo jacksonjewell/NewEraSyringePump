@@ -1,5 +1,6 @@
 """
-Tkinter GUI for controlling three New Era NE-1000 syringe pumps and an Arduino vacuum.
+Tkinter GUI for controlling up to ten New Era NE-1000 syringe pumps, an Arduino-driven
+vacuum + MPX5100DP pressure sensor, and a RUNZE SV-07 multiport selector valve.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from typing import Any, Callable, Optional
 import serial
 import serial.tools.list_ports
 from nesp_lib import Port, Pump, PumpingDirection
+
+from sv07_driver import SV07, SV07Error
 
 
 DARK = {
@@ -130,8 +133,14 @@ RATE_UNITS = ["mL/min", "mL/hr", "uL/min", "uL/hr"]
 DISPENSE_MODES = ["Continuous", "Volume"]
 BAUD_RATES = ["9600", "19200"]
 VACUUM_BAUD_RATES = ["9600", "115200", "57600", "38400"]
+VALVE_BAUD_RATES = ["9600", "19200", "38400", "57600", "115200"]
+VALVE_PORT_COUNT_OPTIONS = [6, 8, 10, 12, 16]
 STX = 0x02
 ETX = 0x03
+
+MIN_PUMPS = 1
+MAX_PUMPS = 10
+DEFAULT_NUM_PUMPS = 3
 
 RECIPES_JSON_VERSION = 1
 
@@ -165,24 +174,189 @@ def pump_labels_file_path() -> Path:
     return Path(__file__).resolve().parent / "pump_labels.json"
 
 
-def load_pump_labels_file() -> dict[str, str]:
-    path = pump_labels_file_path()
-    if not path.is_file():
-        return {}
+def _clamp_pump_count(n: Any) -> int:
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    out: dict[str, str] = {}
-    for k in ("1", "2", "3"):
-        if k in data and data[k] is not None:
-            out[k] = str(data[k]).strip()
+        v = int(n)
+    except (TypeError, ValueError):
+        return DEFAULT_NUM_PUMPS
+    return max(MIN_PUMPS, min(MAX_PUMPS, v))
+
+
+def _coerce_pump_port_map(raw: Any) -> dict[int, int]:
+    """Coerce a raw mapping into ``{pump_index: valve_port}`` with bounds-checked keys."""
+    out: dict[int, int] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        try:
+            idx = int(k)
+            port = int(v)
+        except (TypeError, ValueError):
+            continue
+        if MIN_PUMPS <= idx <= MAX_PUMPS and 1 <= port <= 16:
+            out[idx] = port
     return out
 
 
-def save_pump_labels_file(labels: dict[str, str]) -> None:
-    payload = {str(k): (labels.get(str(k), "") or "").strip() for k in (1, 2, 3)}
+def _coerce_port_labels(raw: Any) -> dict[int, str]:
+    """Coerce a raw mapping into ``{valve_port: label}`` (e.g. ``{5: "Vent"}``).
+
+    Used for non-pump inlets like vents, bleeds, waste, atmosphere, etc.
+    """
+    out: dict[int, str] = {}
+    if not isinstance(raw, dict):
+        return out
+    for k, v in raw.items():
+        try:
+            port = int(k)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= port <= 16 and v is not None:
+            text = str(v).strip()
+            if text:
+                out[port] = text
+    return out
+
+
+def load_pump_labels_file() -> tuple[int, dict[str, str], dict[int, int], dict[int, str]]:
+    """
+    Return ``(num_pumps, labels, pump_port_map, port_labels)`` from ``pump_labels.json``.
+
+    Supports both the new schema
+    (``{"num_pumps": N, "pumps": {"1": "name", ...},
+        "pump_port_map": {"1": 3, ...}, "port_labels": {"5": "Vent", ...}}``)
+    and the legacy schema (``{"1": "name", "2": "name", "3": "name"}``).
+    """
+    path = pump_labels_file_path()
+    if not path.is_file():
+        return DEFAULT_NUM_PUMPS, {}, {}, {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return DEFAULT_NUM_PUMPS, {}, {}, {}
+    if not isinstance(data, dict):
+        return DEFAULT_NUM_PUMPS, {}, {}, {}
+
+    port_map = _coerce_pump_port_map(data.get("pump_port_map"))
+    port_labels = _coerce_port_labels(data.get("port_labels"))
+
+    pumps_block = data.get("pumps")
+    if isinstance(pumps_block, dict):
+        num = _clamp_pump_count(data.get("num_pumps", DEFAULT_NUM_PUMPS))
+        labels: dict[str, str] = {}
+        for k, v in pumps_block.items():
+            try:
+                idx = int(k)
+            except (TypeError, ValueError):
+                continue
+            if MIN_PUMPS <= idx <= MAX_PUMPS and v is not None:
+                labels[str(idx)] = str(v).strip()
+        return num, labels, port_map, port_labels
+
+    legacy_labels: dict[str, str] = {}
+    for k in (str(i) for i in range(MIN_PUMPS, MAX_PUMPS + 1)):
+        if k in data and data[k] is not None:
+            legacy_labels[k] = str(data[k]).strip()
+    if not legacy_labels:
+        return DEFAULT_NUM_PUMPS, {}, port_map, port_labels
+    inferred = max((int(k) for k in legacy_labels), default=DEFAULT_NUM_PUMPS)
+    return (
+        _clamp_pump_count(max(inferred, DEFAULT_NUM_PUMPS)),
+        legacy_labels,
+        port_map,
+        port_labels,
+    )
+
+
+def save_pump_labels_file(
+    num_pumps: int,
+    labels: dict[str, str],
+    pump_port_map: Optional[dict[int, int]] = None,
+    port_labels: Optional[dict[int, str]] = None,
+) -> None:
+    n = _clamp_pump_count(num_pumps)
+    payload: dict[str, Any] = {
+        "num_pumps": n,
+        "pumps": {str(k): (labels.get(str(k), "") or "").strip() for k in range(1, n + 1)},
+    }
+    pm = _coerce_pump_port_map(pump_port_map or {})
+    if pm:
+        payload["pump_port_map"] = {str(k): pm[k] for k in sorted(pm)}
+    pl = _coerce_port_labels(port_labels or {})
+    if pl:
+        payload["port_labels"] = {str(k): pl[k] for k in sorted(pl)}
     pump_labels_file_path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def recipe_num_pumps(recipe: dict[str, Any]) -> int:
+    """Infer the pump count for a recipe (new ``num_pumps`` field, else legacy keys)."""
+    if "num_pumps" in recipe:
+        return _clamp_pump_count(recipe.get("num_pumps"))
+    pumps_map = recipe.get("pumps")
+    if isinstance(pumps_map, dict):
+        keys = []
+        for k in pumps_map.keys():
+            try:
+                keys.append(int(k))
+            except (TypeError, ValueError):
+                continue
+        if keys:
+            return _clamp_pump_count(max(keys))
+    legacy_max = 0
+    for i in range(1, MAX_PUMPS + 1):
+        if isinstance(recipe.get(f"pump{i}"), dict):
+            legacy_max = max(legacy_max, i)
+    if legacy_max > 0:
+        return _clamp_pump_count(legacy_max)
+    return DEFAULT_NUM_PUMPS
+
+
+def recipe_pump_settings(recipe: dict[str, Any], pump_index: int) -> Optional[dict[str, Any]]:
+    """Get a pump-settings dict for ``pump_index`` (1-based) supporting both schemas."""
+    if pump_index < MIN_PUMPS or pump_index > MAX_PUMPS:
+        return None
+    pumps_map = recipe.get("pumps")
+    if isinstance(pumps_map, dict):
+        block = pumps_map.get(str(pump_index)) or pumps_map.get(pump_index)
+        if isinstance(block, dict):
+            return block
+    legacy = recipe.get(f"pump{pump_index}")
+    if isinstance(legacy, dict):
+        return legacy
+    return None
+
+
+def recipe_pump_conn(recipe: dict[str, Any], pump_index: int) -> Optional[dict[str, Any]]:
+    if pump_index < MIN_PUMPS or pump_index > MAX_PUMPS:
+        return None
+    conns_map = recipe.get("pump_conns")
+    if isinstance(conns_map, dict):
+        block = conns_map.get(str(pump_index)) or conns_map.get(pump_index)
+        if isinstance(block, dict):
+            return block
+    legacy = recipe.get(f"pump{pump_index}_conn")
+    if isinstance(legacy, dict):
+        return legacy
+    return None
+
+
+def recipe_valve_conn(recipe: dict[str, Any]) -> Optional[dict[str, Any]]:
+    block = recipe.get("valve_conn")
+    return block if isinstance(block, dict) else None
+
+
+def recipe_pump_port_map(recipe: dict[str, Any]) -> dict[int, int]:
+    """Return ``{pump_index: valve_port}`` from ``pump_port_map`` if present."""
+    raw = recipe.get("pump_port_map")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[int, int] = {}
+    for k, v in raw.items():
+        try:
+            out[int(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def run_on_main_thread(app: tk.Tk, fn: Callable[[], Any], timeout: float = 120.0) -> Any:
@@ -472,6 +646,19 @@ def format_step_summary(step: dict[str, Any], nicknames: Optional[dict[int, str]
         return "Vacuum ON (send 1)"
     if t == "vacuum_off":
         return "Vacuum OFF (send 0)"
+    if t == "valve_connect":
+        b = step.get("baud", 9600)
+        addr = step.get("address", 0)
+        return f"Valve connect {step.get('com')} @ {b} addr {addr}"
+    if t == "valve_disconnect":
+        return "Valve disconnect"
+    if t == "valve_to_port":
+        return f"Valve → port {step.get('port', '?')}"
+    if t == "valve_to_pump":
+        return f"Valve → line for {_pump_step_name(step.get('pump'), nicknames)}"
+    if t == "valve_to_label":
+        lab = str(step.get("label", "?")).strip() or "?"
+        return f"Valve → label '{lab}'"
     return str(step)
 
 
@@ -501,6 +688,9 @@ def _estimate_step_seconds(step: dict[str, Any]) -> float:
                     return (vol_ml / ml_per_min) * 60.0
             except (ValueError, ZeroDivisionError):
                 pass
+    if t in ("valve_to_port", "valve_to_pump", "valve_to_label"):
+        # SV-07 max travel time is ~2 s; budget a small buffer for status polling.
+        return 3.0
     return 0.0
 
 
@@ -525,10 +715,11 @@ def _format_duration(seconds: float) -> str:
     return f"{h} h {m:02d} min {s:02d} s"
 
 
-def _recipe_resources(recipe: dict[str, Any]) -> tuple[set[int], bool]:
-    """Return (set of pump numbers used, vacuum_needed) from recipe steps."""
+def _recipe_resources(recipe: dict[str, Any]) -> tuple[set[int], bool, bool]:
+    """Return (pumps used, vacuum needed, valve needed) from recipe steps."""
     pumps_used: set[int] = set()
     vacuum_needed = False
+    valve_needed = False
     steps = recipe.get("steps")
     if isinstance(steps, list):
         for step in steps:
@@ -542,12 +733,24 @@ def _recipe_resources(recipe: dict[str, Any]) -> tuple[set[int], bool]:
                     pass
             elif t in ("vacuum_connect", "vacuum_disconnect", "vacuum_on", "vacuum_off"):
                 vacuum_needed = True
+            elif t in (
+                "valve_connect",
+                "valve_disconnect",
+                "valve_to_port",
+                "valve_to_pump",
+                "valve_to_label",
+            ):
+                valve_needed = True
+                if t == "valve_to_pump":
+                    try:
+                        pumps_used.add(int(step["pump"]))
+                    except (KeyError, ValueError, TypeError):
+                        pass
     else:
-        for i in range(1, 4):
-            data = recipe.get(f"pump{i}")
-            if isinstance(data, dict):
+        for i in range(1, MAX_PUMPS + 1):
+            if recipe_pump_settings(recipe, i) is not None:
                 pumps_used.add(i)
-    return pumps_used, vacuum_needed
+    return pumps_used, vacuum_needed, valve_needed
 
 
 def _friendly_step_error(step: dict[str, Any], step_index: int, error_msg: str, nicknames: Optional[dict[int, str]] = None) -> str:
@@ -562,7 +765,7 @@ def _friendly_step_error(step: dict[str, Any], step_index: int, error_msg: str, 
         "Suggestion:",
     ]
     low = error_msg.lower()
-    if t in ("connect_pump", "apply_pump", "run_pump", "stop_pump", "line_check"):
+    if t in ("connect_pump", "apply_pump", "run_pump", "stop_pump", "line_check", "disconnect_pump"):
         pnum = step.get("pump", "?")
         if "could not open port" in low or "denied" in low or "filenotfounderror" in low:
             lines.append(f"  - Check that pump {pnum}'s USB cable is plugged in and the COM port is correct.")
@@ -583,6 +786,33 @@ def _friendly_step_error(step: dict[str, Any], step_index: int, error_msg: str, 
             lines.append("    or connect it manually before running.")
         else:
             lines.append("  - Verify the Arduino is powered and the COM port / baud rate are correct.")
+    elif t in (
+        "valve_connect",
+        "valve_disconnect",
+        "valve_to_port",
+        "valve_to_pump",
+        "valve_to_label",
+    ):
+        if "could not open port" in low or "denied" in low or "filenotfounderror" in low:
+            lines.append("  - Check the SV-07 USB-to-RS232/RS485 adapter and COM port assignment.")
+            lines.append("  - Make sure no other program is using the port.")
+        elif "not connected" in low or "not open" in low:
+            lines.append("  - The selector valve is not connected. Add a 'Valve connect' step,")
+            lines.append("    or connect it manually from the Selector Valve tab before running.")
+        elif "no pump-to-port mapping" in low:
+            lines.append("  - Open the recipe and assign a valve port for this pump in the")
+            lines.append("    pump-to-port mapping section.")
+        elif "no port labelled" in low or "no port labeled" in low:
+            lines.append("  - Open the Selector Valve tab and add a Custom port label that")
+            lines.append("    matches this step's label (case-insensitive, trimmed).")
+        elif "checksum" in low or "bad response" in low or "incomplete response" in low:
+            lines.append("  - The valve replied with a malformed frame. Double-check baud rate")
+            lines.append("    and address; verify wiring (RS232 TX/RX or RS485 A/B not swapped).")
+        elif "timeout" in low or "did not complete" in low:
+            lines.append("  - Valve did not finish moving. Check 24 V power and that the rotor")
+            lines.append("    is not jammed; raise the move timeout in the valve panel if needed.")
+        else:
+            lines.append("  - Verify the SV-07 is powered (24 V) and the COM/baud/address match.")
     elif t == "delay":
         lines.append("  - Check that the delay value is a valid number of seconds.")
     else:
@@ -915,7 +1145,7 @@ class PumpPanel(ttk.LabelFrame):
         auto_btn.grid(row=0, column=0, sticky="nsew", padx=(4, 3), pady=(0, 3))
         add_hover_glow(auto_btn)
         apply_btn = tk.Button(
-            action_grid, text="Apply Settings",
+            action_grid, text="Apply pump settings",
             command=lambda: self.app.apply_with_mode(self),
             cursor="hand2", pady=8, **BTN_APPLY_ACCENT,
         )
@@ -926,15 +1156,23 @@ class PumpPanel(ttk.LabelFrame):
             bg="#28A745", fg="white", activebackground="#218838", activeforeground="white",
             font=("Segoe UI", 10, "bold"), pady=8, cursor="hand2", relief="raised", bd=2,
         )
-        run_btn.grid(row=1, column=0, sticky="nsew", padx=(4, 3), pady=(3, 0))
+        run_btn.grid(row=1, column=0, sticky="nsew", padx=(4, 3), pady=(3, 3))
         add_hover_glow(run_btn, "#28A745")
         stop_btn = tk.Button(
             action_grid, text="Stop", command=lambda: self.app.stop_with_mode(self),
             bg="#DC3545", fg="white", activebackground="#C82333", activeforeground="white",
             font=("Segoe UI", 10, "bold"), pady=8, cursor="hand2", relief="raised", bd=2,
         )
-        stop_btn.grid(row=1, column=1, sticky="nsew", padx=(3, 4), pady=(3, 0))
+        stop_btn.grid(row=1, column=1, sticky="nsew", padx=(3, 4), pady=(3, 3))
         add_hover_glow(stop_btn, "#DC3545")
+        switch_btn = tk.Button(
+            action_grid, text="\u2192 Switch valve to this line",
+            command=lambda: self.app.switch_valve_to_pump(self.pump_index),
+            bg="#3B82F6", fg="white", activebackground="#1E40AF", activeforeground="white",
+            font=("Segoe UI", 10, "bold"), pady=8, cursor="hand2", relief="raised", bd=2,
+        )
+        switch_btn.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=(4, 4), pady=(3, 0))
+        add_hover_glow(switch_btn, "#3B82F6")
 
         self.status_var = tk.StringVar(value="Not connected")
         ttk.Label(self, textvariable=self.status_var).grid(row=10, column=0, columnspan=6, sticky="w", pady=(8, 0))
@@ -1632,6 +1870,722 @@ class VacuumPanel(ttk.LabelFrame):
         self._close_serial()
 
 
+class ValvePanel(ttk.LabelFrame):
+    """RUNZE SV-07 selector valve control: connect, switch ports, query status."""
+
+    def __init__(self, master: tk.Widget, app: "PumpControllerApp", ports: list[str]) -> None:
+        super().__init__(master, text="Selector Valve (RUNZE SV-07)", padding=10)
+        self.app = app
+        self._serial_lock = threading.Lock()
+        self.driver: Optional[SV07] = None
+        self.connected_com: Optional[str] = None
+        self._busy = False
+        self._port_buttons: list[tk.Button] = []
+        # Live "Pump → Valve port" mapping table widgets (one row per pump).
+        self._mapping_rows: list[dict[str, Any]] = []
+        self._mapping_inner: Optional[ttk.Frame] = None
+        self._mapping_status_var = tk.StringVar(value="")
+        # Set true while we're rebuilding the table programmatically so the
+        # per-row trace handlers don't echo back into a "save" cycle.
+        self._mapping_suspend_trace = False
+        # "Custom port labels" table (vents/bleeds/waste/etc.) — one row per
+        # valve port up to ``max_ports``.
+        self._label_rows: list[dict[str, Any]] = []
+        self._label_inner: Optional[ttk.Frame] = None
+        self._label_status_var = tk.StringVar(value="")
+        self._label_suspend_trace = False
+        self._build(ports)
+
+    def _build(self, ports: list[str]) -> None:
+        row = 0
+        ttk.Label(self, text="COM Port").grid(row=row, column=0, sticky="w")
+        self.com_var = tk.StringVar(value=(ports[0] if ports else ""))
+        self.com_combo = ttk.Combobox(self, textvariable=self.com_var, values=ports, width=12)
+        self.com_combo.grid(row=row, column=1, sticky="w", padx=(6, 12))
+
+        ttk.Label(self, text="Baud").grid(row=row, column=2, sticky="w")
+        self.baud_var = tk.StringVar(value="9600")
+        ttk.Combobox(
+            self, textvariable=self.baud_var, values=VALVE_BAUD_RATES, state="readonly", width=10,
+        ).grid(row=row, column=3, sticky="w", padx=(6, 12))
+
+        ttk.Label(self, text="Address").grid(row=row, column=4, sticky="w")
+        self.addr_var = tk.StringVar(value="0")
+        ttk.Entry(self, textvariable=self.addr_var, width=6).grid(row=row, column=5, sticky="w", padx=(6, 0))
+
+        row += 1
+        ttk.Label(self, text="Max ports").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        self.max_ports_var = tk.StringVar(value="6")
+        max_combo = ttk.Combobox(
+            self,
+            textvariable=self.max_ports_var,
+            values=[str(n) for n in VALVE_PORT_COUNT_OPTIONS],
+            width=6,
+            state="readonly",
+        )
+        max_combo.grid(row=row, column=1, sticky="w", padx=(6, 12), pady=(6, 0))
+        max_combo.bind("<<ComboboxSelected>>", lambda _e: self._rebuild_port_grid())
+
+        ttk.Label(self, text="Move timeout (s)").grid(row=row, column=2, sticky="w", pady=(6, 0))
+        self.timeout_var = tk.StringVar(value="10")
+        ttk.Entry(self, textvariable=self.timeout_var, width=6).grid(
+            row=row, column=3, sticky="w", padx=(6, 12), pady=(6, 0)
+        )
+
+        row += 1
+        conn_row = ttk.Frame(self)
+        conn_row.grid(row=row, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        for c in range(4):
+            conn_row.columnconfigure(c, weight=1)
+        ttk.Button(conn_row, text="Connect Valve", command=self.connect_async).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        ttk.Button(conn_row, text="Disconnect", command=self.disconnect_async).grid(row=0, column=1, padx=(4, 4), sticky="ew")
+        ttk.Button(conn_row, text="Refresh status", command=self.refresh_status_async).grid(row=0, column=2, padx=(4, 4), sticky="ew")
+        ttk.Button(conn_row, text="Reset to home", command=self.reset_home_async).grid(row=0, column=3, padx=(4, 0), sticky="ew")
+
+        row += 1
+        self.conn_status_var = tk.StringVar(value="Valve: Disconnected")
+        ttk.Label(self, textvariable=self.conn_status_var).grid(
+            row=row, column=0, columnspan=6, sticky="w", pady=(8, 0)
+        )
+
+        row += 1
+        self.position_var = tk.StringVar(value="Current port: —")
+        ttk.Label(self, textvariable=self.position_var, font=("Segoe UI", 12, "bold")).grid(
+            row=row, column=0, columnspan=6, sticky="w", pady=(6, 0)
+        )
+
+        row += 1
+        self.motion_var = tk.StringVar(value="Status: —")
+        ttk.Label(self, textvariable=self.motion_var).grid(
+            row=row, column=0, columnspan=6, sticky="w", pady=(2, 0)
+        )
+
+        row += 1
+        ttk.Label(self, text="Move to port:").grid(row=row, column=0, columnspan=6, sticky="w", pady=(10, 4))
+
+        row += 1
+        self._port_grid = ttk.Frame(self)
+        self._port_grid.grid(row=row, column=0, columnspan=6, sticky="ew")
+
+        row += 1
+        manual = ttk.Frame(self)
+        manual.grid(row=row, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        ttk.Label(manual, text="Manual port").pack(side="left")
+        self.manual_port_var = tk.StringVar(value="1")
+        ttk.Entry(manual, textvariable=self.manual_port_var, width=4).pack(side="left", padx=(6, 6))
+        ttk.Button(manual, text="Move + wait", command=self.move_manual_async).pack(side="left")
+
+        # ----- Side-by-side: pump mapping + custom port labels ---------------
+        row += 1
+        tables_row = ttk.Frame(self)
+        tables_row.grid(row=row, column=0, columnspan=6, sticky="ew", pady=(12, 0))
+        tables_row.columnconfigure(0, weight=1, uniform="vtables")
+        tables_row.columnconfigure(1, weight=1, uniform="vtables")
+
+        # ----- Pump → Valve port mapping table -------------------------------
+        map_frame = ttk.LabelFrame(
+            tables_row,
+            text="Pump → Valve port  (which line is each pump plumbed to)",
+            padding=8,
+        )
+        map_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        for c in range(6):
+            map_frame.columnconfigure(c, weight=1)
+
+        ttk.Label(
+            map_frame,
+            text=("Set each pump's valve port here. The 'Switch valve to this line' "
+                  "buttons on the Pumps tab use this mapping. Saved to pump_labels.json."),
+            wraplength=380,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=6, sticky="w")
+
+        header = ttk.Frame(map_frame)
+        header.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 2))
+        ttk.Label(header, text="Pump", width=6, anchor="w").pack(side="left", padx=(2, 6))
+        ttk.Label(header, text="Nickname", anchor="w").pack(side="left", padx=(0, 6), expand=True, fill="x")
+        ttk.Label(header, text="Valve port", width=12, anchor="w").pack(side="left")
+        ttk.Label(header, text="", width=10).pack(side="left")
+
+        self._mapping_inner = ttk.Frame(map_frame)
+        self._mapping_inner.grid(row=2, column=0, columnspan=6, sticky="ew")
+
+        bottom = ttk.Frame(map_frame)
+        bottom.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        ttk.Button(bottom, text="Clear all", command=self.clear_mapping_all).pack(side="left")
+        ttk.Label(bottom, textvariable=self._mapping_status_var, foreground="#5A8F5A").pack(
+            side="left", padx=(12, 0)
+        )
+
+        # ----- Custom port labels (vents / bleeds / waste / etc.) -----------
+        label_frame = ttk.LabelFrame(
+            tables_row,
+            text="Custom port labels  (vents, bleeds, waste, atmosphere, …)",
+            padding=8,
+        )
+        label_frame.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        for c in range(6):
+            label_frame.columnconfigure(c, weight=1)
+
+        ttk.Label(
+            label_frame,
+            text=("Name any non-pump valve ports — bleed lines, vents, waste, "
+                  "manual reservoirs. These show up on the port buttons above."),
+            wraplength=380,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=6, sticky="w")
+
+        lbl_header = ttk.Frame(label_frame)
+        lbl_header.grid(row=1, column=0, columnspan=6, sticky="ew", pady=(8, 2))
+        ttk.Label(lbl_header, text="Port", width=6, anchor="w").pack(side="left", padx=(2, 6))
+        ttk.Label(lbl_header, text="Label", anchor="w").pack(side="left", padx=(0, 6), expand=True, fill="x")
+        ttk.Label(lbl_header, text="", width=10).pack(side="left")
+
+        self._label_inner = ttk.Frame(label_frame)
+        self._label_inner.grid(row=2, column=0, columnspan=6, sticky="ew")
+
+        lbl_bottom = ttk.Frame(label_frame)
+        lbl_bottom.grid(row=3, column=0, columnspan=6, sticky="ew", pady=(8, 0))
+        ttk.Button(lbl_bottom, text="Clear all", command=self.clear_labels_all).pack(side="left")
+        ttk.Label(lbl_bottom, textvariable=self._label_status_var, foreground="#5A8F5A").pack(
+            side="left", padx=(12, 0)
+        )
+
+        self.columnconfigure(5, weight=1)
+        self._rebuild_port_grid()
+        self.refresh_mapping_table()
+        self.refresh_label_table()
+
+    def _rebuild_port_grid(self) -> None:
+        for child in self._port_grid.winfo_children():
+            child.destroy()
+        self._port_buttons = []
+        try:
+            n = int(self.max_ports_var.get().strip())
+        except ValueError:
+            n = 6
+        n = max(1, min(16, n))
+        cols = 6
+        for i in range(1, n + 1):
+            btn = tk.Button(
+                self._port_grid,
+                text=f"Port {i}",
+                command=lambda p=i: self.move_to_port_async(p),
+                bg="#3A3A50",
+                fg="white",
+                font=("Segoe UI", 9, "bold"),
+                relief="flat",
+                bd=0,
+                padx=8,
+                pady=6,
+                cursor="hand2",
+                width=14,
+                height=2,
+                justify="center",
+                wraplength=140,
+            )
+            r, c = divmod(i - 1, cols)
+            btn.grid(row=r, column=c, padx=4, pady=4, sticky="ew")
+            add_hover_glow(btn, "#3A3A50")
+            self._port_buttons.append(btn)
+        for c in range(cols):
+            self._port_grid.columnconfigure(c, weight=1)
+        self.refresh_port_button_text()
+        # Custom labels table tracks max_ports too — keep them in sync.
+        if self._label_inner is not None:
+            self.refresh_label_table()
+
+    def refresh_port_button_text(self) -> None:
+        """Update each Move-to-port button's caption to reflect what's on the line."""
+        for i, btn in enumerate(self._port_buttons, start=1):
+            try:
+                assignment = self.app.port_assignment_text(i)
+            except Exception:
+                assignment = ""
+            text = f"Port {i}"
+            if assignment:
+                # Truncate long names so the button stays roughly the same size.
+                short = assignment if len(assignment) <= 16 else assignment[:14] + "…"
+                text = f"Port {i}\n{short}"
+            try:
+                if btn.cget("text") != text:
+                    btn.configure(text=text)
+            except tk.TclError:
+                pass
+
+    # ----- Pump → Valve port mapping table -------------------------------
+    def refresh_mapping_table(self) -> None:
+        """Update mapping rows to match ``app.num_pumps`` and the current map.
+
+        If the row count already matches we update existing widgets in place
+        so the user's spinbox doesn't get destroyed mid-edit.
+        """
+        if self._mapping_inner is None:
+            return
+
+        try:
+            num_pumps = max(1, int(self.app.num_pumps))
+        except Exception:
+            num_pumps = 1
+        live_map = dict(self.app._active_pump_port_map)
+
+        if len(self._mapping_rows) == num_pumps:
+            # In-place update: just sync the port and nickname StringVars.
+            self._mapping_suspend_trace = True
+            try:
+                for row in self._mapping_rows:
+                    i = row["pump_index"]
+                    cur = live_map.get(i)
+                    desired = "" if cur is None else str(cur)
+                    if row["port_var"].get() != desired:
+                        row["port_var"].set(desired)
+            finally:
+                self._mapping_suspend_trace = False
+            self.refresh_mapping_nicknames()
+            return
+
+        # Row count changed → full rebuild.
+        for child in self._mapping_inner.winfo_children():
+            child.destroy()
+        self._mapping_rows = []
+
+        self._mapping_suspend_trace = True
+        try:
+            for i in range(1, num_pumps + 1):
+                row_frame = ttk.Frame(self._mapping_inner)
+                row_frame.pack(fill="x", pady=1)
+
+                ttk.Label(row_frame, text=str(i), width=6, anchor="w").pack(side="left", padx=(2, 6))
+
+                nickname = ""
+                if i - 1 < len(self.app.panels):
+                    try:
+                        nickname = self.app.panels[i - 1].nickname_var.get().strip()
+                    except Exception:
+                        nickname = ""
+                nickname_var = tk.StringVar(value=nickname)
+                ttk.Label(row_frame, textvariable=nickname_var, anchor="w").pack(
+                    side="left", padx=(0, 6), expand=True, fill="x"
+                )
+
+                cur = live_map.get(i)
+                port_var = tk.StringVar(value=("" if cur is None else str(cur)))
+                spin = ttk.Spinbox(
+                    row_frame,
+                    from_=0,
+                    to=16,
+                    textvariable=port_var,
+                    width=6,
+                )
+                spin.pack(side="left", padx=(0, 6))
+
+                clear_btn = ttk.Button(
+                    row_frame,
+                    text="Clear",
+                    width=8,
+                    command=lambda p=i: self._clear_mapping_row(p),
+                )
+                clear_btn.pack(side="left")
+
+                row_state = {
+                    "pump_index": i,
+                    "nickname_var": nickname_var,
+                    "port_var": port_var,
+                    "spin": spin,
+                }
+                self._mapping_rows.append(row_state)
+                # Trace must be added *after* row_state is appended so the
+                # handler can find it. Capture ``i`` via a default arg to keep
+                # closures correct across the loop.
+                port_var.trace_add("write", lambda *_a, p=i: self._on_mapping_row_changed(p))
+        finally:
+            self._mapping_suspend_trace = False
+
+    def refresh_mapping_nicknames(self) -> None:
+        """Update only the nickname column (cheap, called from the live tick)."""
+        for row in self._mapping_rows:
+            i = row["pump_index"]
+            if i - 1 < len(self.app.panels):
+                try:
+                    nick = self.app.panels[i - 1].nickname_var.get().strip()
+                except Exception:
+                    nick = ""
+                if row["nickname_var"].get() != nick:
+                    row["nickname_var"].set(nick)
+
+    def _on_mapping_row_changed(self, pump_index: int) -> None:
+        if self._mapping_suspend_trace:
+            return
+        row = next((r for r in self._mapping_rows if r["pump_index"] == pump_index), None)
+        if row is None:
+            return
+        text = row["port_var"].get().strip()
+        new_map = dict(self.app._active_pump_port_map)
+        if text == "" or text == "0":
+            new_map.pop(pump_index, None)
+        else:
+            try:
+                port = int(text)
+            except ValueError:
+                return
+            if port < 1 or port > 16:
+                return
+            new_map[pump_index] = port
+        self.app.set_pump_port_mapping(new_map, persist=True)
+        self._flash_mapping_status("Saved")
+
+    def _clear_mapping_row(self, pump_index: int) -> None:
+        new_map = dict(self.app._active_pump_port_map)
+        if pump_index in new_map:
+            new_map.pop(pump_index, None)
+            self.app.set_pump_port_mapping(new_map, persist=True)
+            self._flash_mapping_status("Cleared")
+
+    def clear_mapping_all(self) -> None:
+        if not self.app._active_pump_port_map:
+            return
+        self.app.set_pump_port_mapping({}, persist=True)
+        self._flash_mapping_status("Cleared all")
+
+    def _flash_mapping_status(self, text: str) -> None:
+        self._mapping_status_var.set(text)
+        self.after(1500, lambda: self._mapping_status_var.set(""))
+
+    # ----- Custom port labels table --------------------------------------
+    def refresh_label_table(self) -> None:
+        """Sync the custom-label rows with the current ``max_ports`` value.
+
+        In-place update when the row count is unchanged (preserves entry focus
+        mid-edit); full rebuild only when ``max_ports`` actually changes.
+        """
+        if self._label_inner is None:
+            return
+
+        n = self._read_max_ports()
+        live_labels = dict(self.app._active_port_labels)
+
+        if len(self._label_rows) == n:
+            self._label_suspend_trace = True
+            try:
+                for row in self._label_rows:
+                    p = row["port"]
+                    desired = live_labels.get(p, "")
+                    if row["label_var"].get() != desired:
+                        row["label_var"].set(desired)
+                    self._update_label_row_hint(row)
+            finally:
+                self._label_suspend_trace = False
+            return
+
+        for child in self._label_inner.winfo_children():
+            child.destroy()
+        self._label_rows = []
+
+        self._label_suspend_trace = True
+        try:
+            for p in range(1, n + 1):
+                row_frame = ttk.Frame(self._label_inner)
+                row_frame.pack(fill="x", pady=1)
+
+                ttk.Label(row_frame, text=str(p), width=6, anchor="w").pack(side="left", padx=(2, 6))
+
+                label_var = tk.StringVar(value=live_labels.get(p, ""))
+                entry = ttk.Entry(row_frame, textvariable=label_var)
+                entry.pack(side="left", padx=(0, 6), expand=True, fill="x")
+
+                hint_var = tk.StringVar(value="")
+                hint_label = ttk.Label(row_frame, textvariable=hint_var, foreground="#888888", width=14)
+                hint_label.pack(side="left", padx=(0, 6))
+
+                clear_btn = ttk.Button(
+                    row_frame,
+                    text="Clear",
+                    width=8,
+                    command=lambda port=p: self._clear_label_row(port),
+                )
+                clear_btn.pack(side="left")
+
+                row_state: dict[str, Any] = {
+                    "port": p,
+                    "label_var": label_var,
+                    "entry": entry,
+                    "hint_var": hint_var,
+                }
+                self._label_rows.append(row_state)
+                self._update_label_row_hint(row_state)
+                label_var.trace_add("write", lambda *_a, port=p: self._on_label_row_changed(port))
+        finally:
+            self._label_suspend_trace = False
+
+    def _update_label_row_hint(self, row: dict[str, Any]) -> None:
+        """Show a small '(Pump N)' hint next to ports that are pump-mapped."""
+        p = row["port"]
+        pump_index: Optional[int] = None
+        for pi, mapped in self.app._active_pump_port_map.items():
+            if mapped == p:
+                pump_index = pi
+                break
+        if pump_index is None:
+            row["hint_var"].set("")
+        else:
+            row["hint_var"].set(f"(Pump {pump_index})")
+
+    def _on_label_row_changed(self, port: int) -> None:
+        if self._label_suspend_trace:
+            return
+        row = next((r for r in self._label_rows if r["port"] == port), None)
+        if row is None:
+            return
+        text = row["label_var"].get().strip()
+        new_labels = dict(self.app._active_port_labels)
+        if text:
+            new_labels[port] = text
+        else:
+            new_labels.pop(port, None)
+        self.app.set_port_labels(new_labels, persist=True)
+        self._flash_label_status("Saved")
+
+    def _clear_label_row(self, port: int) -> None:
+        if port not in self.app._active_port_labels:
+            return
+        new_labels = dict(self.app._active_port_labels)
+        new_labels.pop(port, None)
+        self.app.set_port_labels(new_labels, persist=True)
+        self._flash_label_status("Cleared")
+
+    def clear_labels_all(self) -> None:
+        if not self.app._active_port_labels:
+            return
+        self.app.set_port_labels({}, persist=True)
+        self._flash_label_status("Cleared all")
+
+    def _flash_label_status(self, text: str) -> None:
+        self._label_status_var.set(text)
+        self.after(1500, lambda: self._label_status_var.set(""))
+
+    def update_port_choices(self, ports: list[str]) -> None:
+        current = self.com_var.get().strip()
+        self.com_combo["values"] = ports
+        if not current and ports:
+            self.com_var.set(ports[0])
+
+    def _set_conn_status(self, text: str) -> None:
+        self.conn_status_var.set(text)
+
+    def _set_motion(self, text: str) -> None:
+        self.motion_var.set(f"Status: {text}")
+
+    def _set_position(self, pos: Optional[int]) -> None:
+        if pos is None or pos < 0:
+            self.position_var.set("Current port: —")
+        else:
+            self.position_var.set(f"Current port: {pos}")
+        self._refresh_port_button_highlight(pos)
+
+    def _refresh_port_button_highlight(self, pos: Optional[int]) -> None:
+        for i, btn in enumerate(self._port_buttons, start=1):
+            try:
+                if pos == i:
+                    btn.configure(bg="#28A745")
+                else:
+                    btn.configure(bg="#3A3A50")
+            except tk.TclError:
+                pass
+
+    def _read_max_ports(self) -> int:
+        try:
+            n = int(self.max_ports_var.get().strip())
+        except ValueError:
+            n = 6
+        return max(1, min(16, n))
+
+    def _read_timeout(self) -> float:
+        try:
+            t = float(self.timeout_var.get().strip())
+        except ValueError:
+            t = 10.0
+        return max(1.0, t)
+
+    @property
+    def is_connected(self) -> bool:
+        d = self.driver
+        return d is not None and d.is_open
+
+    def _ensure_open_locked(self) -> SV07:
+        """Open serial inside the lock; raises if no COM port is set."""
+        if self.driver is not None and self.driver.is_open:
+            return self.driver
+        com = self.com_var.get().strip()
+        if not com:
+            raise SV07Error("Select or type a COM port for the valve.")
+        try:
+            baud = int(self.baud_var.get().strip())
+        except ValueError:
+            baud = 9600
+        try:
+            addr = int(self.addr_var.get().strip())
+        except ValueError:
+            addr = 0
+        d = SV07(port=com, baudrate=baud, address=addr, max_ports=self._read_max_ports())
+        d.open()
+        self.driver = d
+        self.connected_com = com
+        return d
+
+    def _close_serial(self) -> None:
+        d = self.driver
+        if d is not None:
+            try:
+                d.close()
+            except Exception:
+                pass
+        self.driver = None
+        self.connected_com = None
+
+    def connect_async(self) -> None:
+        def work() -> None:
+            try:
+                with self._serial_lock:
+                    d = self._ensure_open_locked()
+                    d.max_ports = self._read_max_ports()
+                pos = self._safe_query_position_with_lock()
+                self.after(0, lambda c=d.port, b=d.baudrate, a=d.address: self._set_conn_status(
+                    f"Valve: Connected on {c} @ {b} (addr {a})"
+                ))
+                self.after(0, lambda p=pos: self._set_position(p))
+                self.after(0, lambda: self._set_motion("Idle"))
+            except Exception as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: self._set_conn_status(f"Valve: connect failed — {m}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def disconnect_async(self) -> None:
+        def work() -> None:
+            with self._serial_lock:
+                self._close_serial()
+            self.after(0, lambda: self._set_conn_status("Valve: Disconnected"))
+            self.after(0, lambda: self._set_position(None))
+            self.after(0, lambda: self._set_motion("—"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_serial_explicit(
+        self,
+        com: str,
+        baud: int = 9600,
+        address: int = 0,
+        max_ports: Optional[int] = None,
+    ) -> None:
+        """Open valve serial on ``com`` (used by the recipe runner)."""
+        with self._serial_lock:
+            self._close_serial()
+            d = SV07(
+                port=com,
+                baudrate=baud,
+                address=address,
+                max_ports=max_ports if max_ports is not None else self._read_max_ports(),
+            )
+            d.open()
+            self.driver = d
+            self.connected_com = com
+        self.after(0, lambda c=com: self.com_var.set(c))
+        self.after(0, lambda b=baud: self.baud_var.set(str(b)))
+        self.after(0, lambda a=address: self.addr_var.set(str(a)))
+        if max_ports is not None:
+            self.after(0, lambda mp=max_ports: self.max_ports_var.set(str(mp)))
+            self.after(0, self._rebuild_port_grid)
+        self.after(0, lambda c=com, b=baud, a=address: self._set_conn_status(
+            f"Valve: Connected on {c} @ {b} (addr {a})"
+        ))
+
+    def close_serial_sync(self) -> None:
+        with self._serial_lock:
+            self._close_serial()
+        self.after(0, lambda: self._set_conn_status("Valve: Disconnected"))
+        self.after(0, lambda: self._set_position(None))
+        self.after(0, lambda: self._set_motion("—"))
+
+    def _safe_query_position_with_lock(self) -> Optional[int]:
+        d = self.driver
+        if d is None or not d.is_open:
+            return None
+        try:
+            with self._serial_lock:
+                return d.get_position()
+        except Exception:
+            return None
+
+    def refresh_status_async(self) -> None:
+        def work() -> None:
+            try:
+                with self._serial_lock:
+                    d = self._ensure_open_locked()
+                    text, busy = d.get_status()
+                    pos = d.get_position()
+                self.after(0, lambda t=text: self._set_motion(t))
+                self.after(0, lambda p=pos: self._set_position(p))
+            except Exception as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: self._set_motion(f"Error: {m}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def reset_home_async(self) -> None:
+        def work() -> None:
+            try:
+                with self._serial_lock:
+                    d = self._ensure_open_locked()
+                    d.reset_home()
+                self.after(0, lambda: self._set_motion("Reset → home"))
+                # Give the rotor a moment, then re-query.
+                time.sleep(0.4)
+                pos = self._safe_query_position_with_lock()
+                self.after(0, lambda p=pos: self._set_position(p))
+            except Exception as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: self._set_motion(f"Error: {m}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def move_manual_async(self) -> None:
+        try:
+            p = int(self.manual_port_var.get().strip())
+        except ValueError:
+            self._set_motion("Error: manual port must be a number")
+            return
+        self.move_to_port_async(p)
+
+    def move_to_port_async(self, port: int) -> None:
+        def work() -> None:
+            try:
+                self.move_to_port_sync(port)
+            except Exception as exc:
+                msg = str(exc)
+                self.after(0, lambda m=msg: self._set_motion(f"Error: {m}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def move_to_port_sync(self, port: int, abort: Optional[threading.Event] = None) -> int:
+        """Block until the valve is at *port*. Returns the final reported position."""
+        timeout = self._read_timeout()
+        with self._serial_lock:
+            d = self._ensure_open_locked()
+            d.max_ports = self._read_max_ports()
+            self.after(0, lambda p=port: self._set_motion(f"Moving → port {p}…"))
+            final = d.move_and_wait(port, timeout_s=timeout, abort=abort)
+        if final is None or final < 0:
+            self.after(0, lambda: self._set_motion("Move aborted"))
+            return -1
+        self.after(0, lambda f=final: self._set_position(f))
+        self.after(0, lambda f=final: self._set_motion(f"Idle (port {f})"))
+        return final
+
+    def close(self) -> None:
+        with self._serial_lock:
+            self._close_serial()
+
+
 def pump_connection_snapshot(panel: "PumpPanel") -> dict[str, Any]:
     return {
         "com": panel.com_var.get().strip(),
@@ -1723,6 +2677,14 @@ class RecipeSequenceEditor(tk.Toplevel):
         row3.pack(fill="x")
         ttk.Button(row3, text="Vacuum ON", command=lambda: self._push_step({"type": "vacuum_on"})).pack(side="left", padx=(0, 4), pady=2)
         ttk.Button(row3, text="Vacuum OFF", command=lambda: self._push_step({"type": "vacuum_off"})).pack(side="left", padx=(0, 4), pady=2)
+        row4 = ttk.Frame(add_fr)
+        row4.pack(fill="x")
+        ttk.Button(row4, text="Valve connect…", command=self._add_valve_connect).pack(side="left", padx=(0, 4), pady=2)
+        ttk.Button(row4, text="Valve disconnect", command=lambda: self._push_step({"type": "valve_disconnect"})).pack(side="left", padx=(0, 4), pady=2)
+        ttk.Button(row4, text="Valve → port…", command=self._add_valve_to_port).pack(side="left", padx=(0, 4), pady=2)
+        ttk.Button(row4, text="Valve → line for pump…", command=self._add_valve_to_pump).pack(side="left", padx=(0, 4), pady=2)
+        ttk.Button(row4, text="Valve → custom inlet…", command=self._add_valve_to_label).pack(side="left", padx=(0, 4), pady=2)
+        ttk.Button(row4, text="Pump↔Port mapping…", command=self._open_port_map_editor).pack(side="left", padx=(16, 4), pady=2)
 
         bot = ttk.Frame(outer)
         bot.pack(fill="x")
@@ -1799,6 +2761,37 @@ class RecipeSequenceEditor(tk.Toplevel):
         s = self._lb.curselection()
         return int(s[0]) if s else None
 
+    def _pump_max(self) -> int:
+        return _clamp_pump_count(getattr(self.app, "num_pumps", DEFAULT_NUM_PUMPS))
+
+    def _pump_choices(self) -> list[str]:
+        return [str(i) for i in range(1, self._pump_max() + 1)]
+
+    def _pump_label(self) -> str:
+        n = self._pump_max()
+        return f"Pump (1–{n})"
+
+    def _pump_label_short(self, action: str) -> str:
+        n = self._pump_max()
+        return f"Pump number (1–{n}) for {action}:"
+
+    def _clamp_pump(self, raw: Any) -> int:
+        try:
+            v = int(raw)
+        except (TypeError, ValueError):
+            return 1
+        return max(1, min(self._pump_max(), v))
+
+    def _ask_pump_int(self, title: str, prompt: str, initial: int = 1) -> Optional[int]:
+        return simpledialog.askinteger(
+            title,
+            prompt,
+            parent=self,
+            minvalue=1,
+            maxvalue=self._pump_max(),
+            initialvalue=max(1, min(self._pump_max(), initial)),
+        )
+
     def _push_step(self, step: dict[str, Any]) -> None:
         self._steps.append(step)
         self._refresh_lb()
@@ -1864,74 +2857,45 @@ class RecipeSequenceEditor(tk.Toplevel):
         elif t == "connect_pump":
             self._open_connect_pump_dialog(edit_index=index, initial=st)
         elif t == "disconnect_pump":
-            try:
-                cur_p = int(st.get("pump", 1))
-            except (TypeError, ValueError):
-                cur_p = 1
-            cur_p = max(1, min(3, cur_p))
-            p = simpledialog.askinteger(
-                "Disconnect pump",
-                "Pump number (1–3):",
-                parent=self,
-                minvalue=1,
-                maxvalue=3,
-                initialvalue=cur_p,
-            )
+            cur_p = self._clamp_pump(st.get("pump", 1))
+            p = self._ask_pump_int("Disconnect pump", self._pump_label_short("disconnect"), cur_p)
             if p is not None:
                 self._commit_step(index, {"type": "disconnect_pump", "pump": int(p)})
         elif t == "apply_pump":
             self._open_apply_pump_dialog(edit_index=index, initial=st)
         elif t == "run_pump":
-            try:
-                cur_p = int(st.get("pump", 1))
-            except (TypeError, ValueError):
-                cur_p = 1
-            cur_p = max(1, min(3, cur_p))
-            p = simpledialog.askinteger(
-                "Run pump",
-                "Pump number (1–3):",
-                parent=self,
-                minvalue=1,
-                maxvalue=3,
-                initialvalue=cur_p,
-            )
+            cur_p = self._clamp_pump(st.get("pump", 1))
+            p = self._ask_pump_int("Run pump", self._pump_label_short("run"), cur_p)
             if p is not None:
                 self._commit_step(index, {"type": "run_pump", "pump": int(p)})
         elif t == "line_check":
-            try:
-                cur_p = int(st.get("pump", 1))
-            except (TypeError, ValueError):
-                cur_p = 1
-            cur_p = max(1, min(3, cur_p))
-            p = simpledialog.askinteger(
-                "Confirm line",
-                "Pump number (1–3) for line check:",
-                parent=self,
-                minvalue=1,
-                maxvalue=3,
-                initialvalue=cur_p,
-            )
+            cur_p = self._clamp_pump(st.get("pump", 1))
+            p = self._ask_pump_int("Confirm line", self._pump_label_short("line check"), cur_p)
             if p is not None:
                 self._commit_step(index, {"type": "line_check", "pump": int(p)})
         elif t == "stop_pump":
-            try:
-                cur_p = int(st.get("pump", 1))
-            except (TypeError, ValueError):
-                cur_p = 1
-            cur_p = max(1, min(3, cur_p))
-            p = simpledialog.askinteger(
-                "Stop pump",
-                "Pump number (1–3):",
-                parent=self,
-                minvalue=1,
-                maxvalue=3,
-                initialvalue=cur_p,
-            )
+            cur_p = self._clamp_pump(st.get("pump", 1))
+            p = self._ask_pump_int("Stop pump", self._pump_label_short("stop"), cur_p)
             if p is not None:
                 self._commit_step(index, {"type": "stop_pump", "pump": int(p)})
         elif t == "vacuum_connect":
             self._open_vacuum_connect_dialog(edit_index=index, initial=st)
-        elif t in ("vacuum_disconnect", "vacuum_on", "vacuum_off"):
+        elif t == "valve_connect":
+            self._open_valve_connect_dialog(edit_index=index, initial=st)
+        elif t == "valve_to_port":
+            self._open_valve_to_port_dialog(edit_index=index, initial=st)
+        elif t == "valve_to_pump":
+            cur_p = self._clamp_pump(st.get("pump", 1))
+            p = self._ask_pump_int(
+                "Valve → line for pump",
+                f"Move valve to the port mapped to which pump (1–{self._pump_max()})?",
+                cur_p,
+            )
+            if p is not None:
+                self._commit_step(index, {"type": "valve_to_pump", "pump": int(p)})
+        elif t == "valve_to_label":
+            self._open_valve_to_label_dialog(edit_index=index, initial=st)
+        elif t in ("vacuum_disconnect", "vacuum_on", "vacuum_off", "valve_disconnect"):
             messagebox.showinfo(
                 "Edit step",
                 "This step has no settings to change. Use Remove step if you no longer need it.",
@@ -2022,8 +2986,8 @@ class RecipeSequenceEditor(tk.Toplevel):
         fr = ttk.Frame(d, padding=10)
         fr.pack(fill="both", expand=True)
         pv = tk.StringVar(value="1")
-        ttk.Label(fr, text="Pump (1–3)").grid(row=0, column=0, sticky="w")
-        ttk.Combobox(fr, textvariable=pv, values=["1", "2", "3"], width=6, state="readonly").grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(fr, text=self._pump_label()).grid(row=0, column=0, sticky="w")
+        ttk.Combobox(fr, textvariable=pv, values=self._pump_choices(), width=6, state="readonly").grid(row=0, column=1, sticky="w", padx=6)
         com0 = "COM8"
         if initial:
             try:
@@ -2063,7 +3027,7 @@ class RecipeSequenceEditor(tk.Toplevel):
             except ValueError:
                 messagebox.showerror("Connect pump", "Invalid number.", parent=d)
                 return
-            if p not in (1, 2, 3):
+            if p < 1 or p > self._pump_max():
                 return
             self._commit_step(
                 edit_index,
@@ -2075,7 +3039,7 @@ class RecipeSequenceEditor(tk.Toplevel):
         ttk.Button(fr, text=("Save" if is_edit else "Add"), command=ok).grid(row=4, column=1, pady=(12, 0), sticky="e")
 
     def _add_disconnect_pump(self) -> None:
-        p = simpledialog.askinteger("Disconnect pump", "Pump number (1–3):", parent=self, minvalue=1, maxvalue=3)
+        p = self._ask_pump_int("Disconnect pump", self._pump_label_short("disconnect"))
         if p is not None:
             self._push_step({"type": "disconnect_pump", "pump": int(p)})
 
@@ -2094,8 +3058,8 @@ class RecipeSequenceEditor(tk.Toplevel):
         fr.pack(fill="both", expand=True)
 
         pv = tk.StringVar(value="1")
-        ttk.Label(fr, text="Pump (1–3)").grid(row=0, column=0, sticky="w")
-        pump_cb = ttk.Combobox(fr, textvariable=pv, values=["1", "2", "3"], width=6, state="readonly")
+        ttk.Label(fr, text=self._pump_label()).grid(row=0, column=0, sticky="w")
+        pump_cb = ttk.Combobox(fr, textvariable=pv, values=self._pump_choices(), width=6, state="readonly")
         pump_cb.grid(row=0, column=1, sticky="w", padx=6)
 
         syringe_var = tk.StringVar(value="BD 10 mL (10 cc)")
@@ -2108,7 +3072,7 @@ class RecipeSequenceEditor(tk.Toplevel):
 
         if initial and initial.get("type") == "apply_pump":
             try:
-                pv.set(str(max(1, min(3, int(initial.get("pump", 1))))))
+                pv.set(str(max(1, min(self._pump_max(), int(initial.get("pump", 1))))))
             except (TypeError, ValueError):
                 pv.set("1")
             s = initial.get("settings") if isinstance(initial.get("settings"), dict) else {}
@@ -2209,7 +3173,7 @@ class RecipeSequenceEditor(tk.Toplevel):
             except ValueError:
                 messagebox.showerror("Apply pump", "Invalid pump number.", parent=d)
                 return
-            if p not in (1, 2, 3):
+            if p < 1 or p > self._pump_max():
                 return
             settings: dict[str, Any] = {
                 "syringe": syringe_var.get(),
@@ -2235,23 +3199,20 @@ class RecipeSequenceEditor(tk.Toplevel):
             load_from_main()
 
     def _add_run_pump(self) -> None:
-        p = simpledialog.askinteger("Run pump", "Pump number (1–3):", parent=self, minvalue=1, maxvalue=3)
+        p = self._ask_pump_int("Run pump", self._pump_label_short("run"))
         if p is not None:
             self._push_step({"type": "run_pump", "pump": int(p)})
 
     def _add_line_check(self) -> None:
-        p = simpledialog.askinteger(
+        p = self._ask_pump_int(
             "Confirm line",
-            "Pump number (1–3) — pause until operator confirms that line is open:",
-            parent=self,
-            minvalue=1,
-            maxvalue=3,
+            f"Pump number (1–{self._pump_max()}) — pause until operator confirms that line is open:",
         )
         if p is not None:
             self._push_step({"type": "line_check", "pump": int(p)})
 
     def _add_stop_pump(self) -> None:
-        p = simpledialog.askinteger("Stop pump", "Pump number (1–3):", parent=self, minvalue=1, maxvalue=3)
+        p = self._ask_pump_int("Stop pump", self._pump_label_short("stop"))
         if p is not None:
             self._push_step({"type": "stop_pump", "pump": int(p)})
 
@@ -2320,6 +3281,267 @@ class RecipeSequenceEditor(tk.Toplevel):
     def _add_vacuum_disconnect(self) -> None:
         self._push_step({"type": "vacuum_disconnect"})
 
+    # --- Valve step dialogs --------------------------------------------------
+
+    def _add_valve_connect(self) -> None:
+        self._open_valve_connect_dialog()
+
+    def _open_valve_connect_dialog(
+        self, edit_index: Optional[int] = None, initial: Optional[dict[str, Any]] = None
+    ) -> None:
+        is_edit = edit_index is not None
+        d = tk.Toplevel(self)
+        d.title("Edit valve connect" if is_edit else "Valve connect (RUNZE SV-07)")
+        d.transient(self)
+        d.geometry("420x220")
+        fr = ttk.Frame(d, padding=12)
+        fr.pack(fill="both", expand=True)
+
+        com0 = "COM4"
+        baud0 = "9600"
+        addr0 = "0"
+        max_ports0 = "6"
+        if initial and initial.get("type") == "valve_connect":
+            com0 = str(initial.get("com") or "COM4").strip() or "COM4"
+            try:
+                baud0 = str(int(initial.get("baud", 9600)))
+            except (TypeError, ValueError):
+                baud0 = "9600"
+            try:
+                addr0 = str(int(initial.get("address", 0)))
+            except (TypeError, ValueError):
+                addr0 = "0"
+            try:
+                max_ports0 = str(int(initial.get("max_ports", 6)))
+            except (TypeError, ValueError):
+                max_ports0 = "6"
+
+        cv = tk.StringVar(value=com0)
+        bv = tk.StringVar(value=baud0)
+        av = tk.StringVar(value=addr0)
+        mv = tk.StringVar(value=max_ports0)
+
+        ttk.Label(fr, text="Valve COM port").grid(row=0, column=0, sticky="w")
+        ttk.Combobox(fr, textvariable=cv, values=self._com_port_values(com0), width=14).grid(
+            row=0, column=1, sticky="w", padx=8
+        )
+        ttk.Label(fr, text="Baud rate").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            fr, textvariable=bv, values=list(VALVE_BAUD_RATES), width=10, state="readonly"
+        ).grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(fr, text="Address").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(fr, textvariable=av, width=8).grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Label(fr, text="Max ports").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(
+            fr,
+            textvariable=mv,
+            values=[str(n) for n in VALVE_PORT_COUNT_OPTIONS],
+            width=8,
+            state="readonly",
+        ).grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        def ok() -> None:
+            com = cv.get().strip()
+            if not com:
+                messagebox.showerror("Valve connect", "Enter a COM port.", parent=d)
+                return
+            try:
+                baud = int(bv.get().strip())
+                addr = int(av.get().strip())
+                max_ports = int(mv.get().strip())
+            except ValueError:
+                messagebox.showerror("Valve connect", "Invalid number.", parent=d)
+                return
+            self._commit_step(
+                edit_index,
+                {
+                    "type": "valve_connect",
+                    "com": com,
+                    "baud": baud,
+                    "address": addr,
+                    "max_ports": max_ports,
+                },
+            )
+            d.destroy()
+
+        bf = ttk.Frame(fr)
+        bf.grid(row=4, column=0, columnspan=2, pady=(14, 0), sticky="w")
+        ttk.Button(bf, text="Cancel", command=d.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(bf, text=("Save" if is_edit else "Add step"), command=ok).pack(side="left")
+
+    def _add_valve_to_port(self) -> None:
+        self._open_valve_to_port_dialog()
+
+    def _open_valve_to_port_dialog(
+        self, edit_index: Optional[int] = None, initial: Optional[dict[str, Any]] = None
+    ) -> None:
+        cur = 1
+        if initial and initial.get("type") == "valve_to_port":
+            try:
+                cur = max(1, min(16, int(initial.get("port", 1))))
+            except (TypeError, ValueError):
+                cur = 1
+        p = simpledialog.askinteger(
+            "Valve → port",
+            "Move valve to port (1–16):",
+            parent=self,
+            minvalue=1,
+            maxvalue=16,
+            initialvalue=cur,
+        )
+        if p is not None:
+            self._commit_step(edit_index, {"type": "valve_to_port", "port": int(p)})
+
+    def _add_valve_to_pump(self) -> None:
+        p = self._ask_pump_int(
+            "Valve → line for pump",
+            f"Move valve to the port mapped to which pump (1–{self._pump_max()})?",
+        )
+        if p is not None:
+            self._push_step({"type": "valve_to_pump", "pump": int(p)})
+
+    def _add_valve_to_label(self) -> None:
+        self._open_valve_to_label_dialog()
+
+    def _open_valve_to_label_dialog(
+        self, edit_index: Optional[int] = None, initial: Optional[dict[str, Any]] = None
+    ) -> None:
+        """Add or edit a ``valve_to_label`` step (custom inlets — vents, bleeds, etc.)."""
+        is_edit = edit_index is not None
+        # Pull the current set of custom labels from the live app state so the
+        # combobox suggests the names the user has already configured. The
+        # final stored value is whatever they confirm (typing a new name is OK).
+        active_labels = dict(getattr(self.app, "_active_port_labels", {}) or {})
+        suggestions = [
+            f"{lab}  (port {port})"
+            for port, lab in sorted(active_labels.items(), key=lambda kv: kv[0])
+        ]
+
+        d = tk.Toplevel(self)
+        d.title("Valve → custom inlet")
+        d.transient(self)
+        d.grab_set()
+        fr = ttk.Frame(d, padding=12)
+        fr.pack(fill="both", expand=True)
+        ttk.Label(
+            fr,
+            text=("Pick (or type) a custom port label. The label is resolved to "
+                  "a port at run time using the labels on the Selector Valve tab."),
+            wraplength=380,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        ttk.Label(fr, text="Label").grid(row=1, column=0, sticky="w")
+        initial_text = ""
+        if initial and initial.get("type") == "valve_to_label":
+            initial_text = str(initial.get("label", "")).strip()
+        label_var = tk.StringVar(value=initial_text)
+        combo = ttk.Combobox(fr, textvariable=label_var, values=suggestions, width=36)
+        combo.grid(row=1, column=1, sticky="ew", padx=(8, 0))
+
+        def ok() -> None:
+            raw = label_var.get().strip()
+            if not raw:
+                messagebox.showerror("Valve → custom inlet", "Pick or type a label.", parent=d)
+                return
+            # If the user picked a suggestion like 'Vent  (port 5)', strip the
+            # trailing port hint so we save just the label text.
+            cleaned = raw
+            if "  (port" in cleaned:
+                cleaned = cleaned.split("  (port", 1)[0].strip()
+            self._commit_step(edit_index, {"type": "valve_to_label", "label": cleaned})
+            d.destroy()
+
+        bf = ttk.Frame(fr)
+        bf.grid(row=2, column=0, columnspan=2, pady=(14, 0), sticky="w")
+        ttk.Button(bf, text="Cancel", command=d.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(bf, text=("Save" if is_edit else "Add step"), command=ok).pack(side="left")
+        fr.columnconfigure(1, weight=1)
+
+    def _open_port_map_editor(self) -> None:
+        """Per-recipe pump↔valve-port mapping editor. Saves to the recipe immediately."""
+        rid = self._recipe_id
+        if not rid:
+            messagebox.showerror(
+                "Pump↔Port mapping",
+                "Recipe has no id; save the recipe from the main Recipes window first.",
+                parent=self,
+            )
+            return
+        all_recipes = load_stored_recipes()
+        target = next((r for r in all_recipes if r.get("id") == rid), None)
+        if target is None:
+            messagebox.showerror("Pump↔Port mapping", "Recipe not found in file.", parent=self)
+            return
+
+        existing_map = recipe_pump_port_map(target)
+        n_pumps = self._pump_max()
+
+        d = tk.Toplevel(self)
+        d.title(f"Pump↔Port mapping — {target.get('name', '')}")
+        d.transient(self)
+        d.geometry("440x{0}".format(140 + 32 * max(1, n_pumps)))
+        fr = ttk.Frame(d, padding=12)
+        fr.pack(fill="both", expand=True)
+        ttk.Label(
+            fr,
+            text=(
+                "Set which valve port each pump's line is plumbed to. "
+                "‘Valve → line for pump N’ steps will use this mapping."
+            ),
+            wraplength=400,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        nicks = self.app.pump_nickname_map()
+        ttk.Label(fr, text="Pump", font=("Segoe UI", 9, "bold")).grid(row=1, column=0, sticky="w")
+        ttk.Label(fr, text="Nickname", font=("Segoe UI", 9, "bold")).grid(row=1, column=1, sticky="w")
+        ttk.Label(fr, text="Valve port (blank = none)", font=("Segoe UI", 9, "bold")).grid(
+            row=1, column=2, sticky="w"
+        )
+
+        port_vars: dict[int, tk.StringVar] = {}
+        for i in range(1, n_pumps + 1):
+            initial_port = existing_map.get(i)
+            v = tk.StringVar(value=str(initial_port) if initial_port else "")
+            port_vars[i] = v
+            ttk.Label(fr, text=f"Pump {i}").grid(row=1 + i, column=0, sticky="w", pady=2)
+            ttk.Label(fr, text=nicks.get(i, "")).grid(row=1 + i, column=1, sticky="w", pady=2)
+            ttk.Entry(fr, textvariable=v, width=8).grid(row=1 + i, column=2, sticky="w", pady=2)
+
+        def save_map() -> None:
+            new_map: dict[str, int] = {}
+            for i, var in port_vars.items():
+                raw = var.get().strip()
+                if not raw:
+                    continue
+                try:
+                    n = int(raw)
+                except ValueError:
+                    messagebox.showerror(
+                        "Pump↔Port mapping",
+                        f"Pump {i}: '{raw}' is not a valid port number.",
+                        parent=d,
+                    )
+                    return
+                if n < 1 or n > 16:
+                    messagebox.showerror(
+                        "Pump↔Port mapping",
+                        f"Pump {i}: port must be between 1 and 16 (got {n}).",
+                        parent=d,
+                    )
+                    return
+                new_map[str(i)] = n
+            target["pump_port_map"] = new_map
+            save_stored_recipes(all_recipes)
+            self._on_saved()
+            messagebox.showinfo("Pump↔Port mapping", "Mapping saved to recipe.", parent=d)
+            d.destroy()
+
+        bf = ttk.Frame(fr)
+        bf.grid(row=2 + n_pumps, column=0, columnspan=3, pady=(14, 0), sticky="w")
+        ttk.Button(bf, text="Cancel", command=d.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(bf, text="Save mapping", command=save_map).pack(side="left")
+
     def _save(self) -> None:
         rid = self._recipe_id
         if not rid:
@@ -2337,7 +3559,7 @@ class RecipeSequenceEditor(tk.Toplevel):
 
 
 class RecipesPanel(ttk.Frame):
-    """Save / load pump 1–3 parameter sets; apply to panels or apply+run connected pumps."""
+    """Save / load N-pump parameter sets; apply to panels or apply+run connected pumps."""
 
     def __init__(self, master: tk.Widget, app: "PumpControllerApp") -> None:
         super().__init__(master, padding=4)
@@ -2347,8 +3569,12 @@ class RecipesPanel(ttk.Frame):
         ttk.Label(self, text="Recipes", font=("Segoe UI", 11, "bold")).pack(anchor="w")
         ttk.Label(
             self,
-            text="Saves pump settings + COM/baud/address. Use “Edit sequence…” for delays, vacuum, "
-            "and ordered connect/apply/run steps. If a sequence exists, “Run sequence” executes it.",
+            text=(
+                "Saves pump settings + COM/baud/address for every pump panel currently shown, "
+                "plus the valve connection if connected. Use “Edit sequence…” for delays, vacuum, "
+                "valve switching, and ordered connect/apply/run steps. If a sequence exists, "
+                "“Run sequence” executes it."
+            ),
             wraplength=420,
         ).pack(anchor="w", pady=(4, 8))
 
@@ -2441,21 +3667,26 @@ class RecipesPanel(ttk.Frame):
         if not name:
             messagebox.showwarning("Recipes", "Enter a name for the new recipe.", parent=self.winfo_toplevel())
             return
+        n = len(self.app.panels)
+        pumps_block: dict[str, Any] = {}
+        conns_block: dict[str, Any] = {}
+        labels_block: dict[str, str] = {}
+        for i, panel in enumerate(self.app.panels, start=1):
+            pumps_block[str(i)] = panel.snapshot_settings()
+            conns_block[str(i)] = pump_connection_snapshot(panel)
+            labels_block[str(i)] = panel.nickname_var.get().strip()
+
         recipe: dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "name": name,
-            "pump1": self.app.panels[0].snapshot_settings(),
-            "pump2": self.app.panels[1].snapshot_settings(),
-            "pump3": self.app.panels[2].snapshot_settings(),
-            "pump1_conn": pump_connection_snapshot(self.app.panels[0]),
-            "pump2_conn": pump_connection_snapshot(self.app.panels[1]),
-            "pump3_conn": pump_connection_snapshot(self.app.panels[2]),
-            "pump_labels": {
-                "1": self.app.panels[0].nickname_var.get().strip(),
-                "2": self.app.panels[1].nickname_var.get().strip(),
-                "3": self.app.panels[2].nickname_var.get().strip(),
-            },
+            "num_pumps": n,
+            "pumps": pumps_block,
+            "pump_conns": conns_block,
+            "pump_labels": labels_block,
         }
+        valve_snap = self.app.valve_connection_snapshot()
+        if valve_snap is not None:
+            recipe["valve_conn"] = valve_snap
         self._recipes.append(recipe)
         save_stored_recipes(self._recipes)
         self.refresh_list()
@@ -2527,18 +3758,294 @@ class RecipesPanel(ttk.Frame):
         self._set_status("Recipe deleted.")
 
 
+class OverviewTab(ttk.Frame):
+    """Compact landing page showing live status + critical actions for every device."""
+
+    PUMP_CARD_COLS = 3
+
+    def __init__(self, master: tk.Widget, app: "PumpControllerApp") -> None:
+        super().__init__(master)
+        self.app = app
+        self._pump_cards: list[dict[str, Any]] = []
+        self._vac_bar_var = tk.StringVar(value="Vacuum: --- bar")
+        self._vac_kpa_var = tk.StringVar(value="--- kPa")
+        self._vac_inhg_var = tk.StringVar(value="--- inHg")
+        self._vac_status_var = tk.StringVar(value="Disconnected")
+        self._vac_toggle_btn: Optional[tk.Button] = None
+        self._valve_pos_var = tk.StringVar(value="Current: —")
+        self._valve_status_var = tk.StringVar(value="Disconnected")
+        self._valve_port_grid: Optional[ttk.Frame] = None
+        self._valve_port_buttons: list[tk.Button] = []
+        self._build()
+
+    def _build(self) -> None:
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=2)
+        self.rowconfigure(1, weight=1)
+
+        # --- PUMPS section ---------------------------------------------------
+        self._pumps_section = ttk.LabelFrame(self, text="Pumps", padding=8)
+        self._pumps_section.grid(row=0, column=0, sticky="nsew", padx=4, pady=(0, 6))
+        self._pumps_grid = ttk.Frame(self._pumps_section)
+        self._pumps_grid.pack(fill="both", expand=True)
+        self._build_pump_cards()
+
+        # --- Bottom section: vacuum + valve side-by-side ---------------------
+        bottom = ttk.Frame(self)
+        bottom.grid(row=1, column=0, sticky="nsew", padx=4)
+        bottom.columnconfigure(0, weight=1, uniform="b")
+        bottom.columnconfigure(1, weight=1, uniform="b")
+        bottom.rowconfigure(0, weight=1)
+
+        # Vacuum card
+        vac_card = ttk.LabelFrame(bottom, text="Vacuum / Pressure", padding=10)
+        vac_card.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        ttk.Label(vac_card, textvariable=self._vac_bar_var, font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        sub_fr = ttk.Frame(vac_card)
+        sub_fr.pack(fill="x", pady=(4, 8))
+        ttk.Label(sub_fr, textvariable=self._vac_kpa_var, font=("Segoe UI", 11)).pack(side="left", padx=(0, 14))
+        ttk.Label(sub_fr, textvariable=self._vac_inhg_var, font=("Segoe UI", 11)).pack(side="left")
+        ttk.Label(vac_card, textvariable=self._vac_status_var, foreground="#888").pack(anchor="w", pady=(0, 8))
+        btn_fr = ttk.Frame(vac_card)
+        btn_fr.pack(fill="x")
+        self._vac_toggle_btn = tk.Button(
+            btn_fr, text="Vacuum ON", command=self._toggle_vacuum,
+            bg="#28A745", fg="white", activebackground="#218838", activeforeground="white",
+            font=("Segoe UI", 10, "bold"), padx=12, pady=6, cursor="hand2", relief="flat", bd=0,
+        )
+        self._vac_toggle_btn.pack(side="left", padx=(0, 6))
+        add_hover_glow(self._vac_toggle_btn, "#28A745")
+        connect_btn = tk.Button(
+            btn_fr, text="Connect", command=self._connect_vacuum,
+            bg="#3A3A50", fg="white", activebackground="#2E2E42", activeforeground="white",
+            font=("Segoe UI", 10), padx=10, pady=6, cursor="hand2", relief="flat", bd=0,
+        )
+        connect_btn.pack(side="left")
+        add_hover_glow(connect_btn, "#3A3A50")
+
+        # Valve card
+        valve_card = ttk.LabelFrame(bottom, text="Selector Valve (SV-07)", padding=10)
+        valve_card.grid(row=0, column=1, sticky="nsew", padx=(4, 0))
+        ttk.Label(valve_card, textvariable=self._valve_pos_var, font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(valve_card, textvariable=self._valve_status_var, foreground="#888").pack(anchor="w", pady=(2, 8))
+        self._valve_port_grid = ttk.Frame(valve_card)
+        self._valve_port_grid.pack(fill="x")
+        self._build_valve_port_buttons()
+        v_btn_fr = ttk.Frame(valve_card)
+        v_btn_fr.pack(fill="x", pady=(8, 0))
+        v_connect_btn = tk.Button(
+            v_btn_fr, text="Connect Valve", command=self._connect_valve,
+            bg="#3A3A50", fg="white", activebackground="#2E2E42", activeforeground="white",
+            font=("Segoe UI", 10), padx=10, pady=6, cursor="hand2", relief="flat", bd=0,
+        )
+        v_connect_btn.pack(side="left", padx=(0, 6))
+        add_hover_glow(v_connect_btn, "#3A3A50")
+
+    # --- pump cards ---------------------------------------------------------
+
+    def _build_pump_cards(self) -> None:
+        for child in self._pumps_grid.winfo_children():
+            child.destroy()
+        self._pump_cards = []
+        cols = self.PUMP_CARD_COLS
+        for c in range(cols):
+            self._pumps_grid.columnconfigure(c, weight=1, uniform="ovcard")
+        for i, panel in enumerate(self.app.panels):
+            r, c = divmod(i, cols)
+            self._pump_cards.append(self._build_pump_card(self._pumps_grid, panel, r, c))
+
+    def _build_pump_card(
+        self, parent: ttk.Frame, panel: PumpPanel, row: int, col: int
+    ) -> dict[str, Any]:
+        title = f"Pump {panel.pump_index}"
+        card = ttk.LabelFrame(parent, text=title, padding=8)
+        card.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+        nick_var = tk.StringVar(value=panel.nickname_var.get().strip() or "(no nickname)")
+        status_var = tk.StringVar(value="Not connected")
+        live_var = tk.StringVar(value="—")
+        ttk.Label(card, textvariable=nick_var, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(card, textvariable=status_var, foreground="#888").pack(anchor="w")
+        ttk.Label(card, textvariable=live_var, font=("Segoe UI", 9), wraplength=240).pack(anchor="w", pady=(4, 8))
+
+        btn_fr = ttk.Frame(card)
+        btn_fr.pack(fill="x")
+        run_btn = tk.Button(
+            btn_fr, text="Run", command=lambda p=panel: self.app.run_with_mode(p),
+            bg="#28A745", fg="white", activebackground="#218838", activeforeground="white",
+            font=("Segoe UI", 9, "bold"), padx=8, pady=4, cursor="hand2", relief="flat", bd=0,
+        )
+        run_btn.pack(side="left", padx=(0, 4))
+        add_hover_glow(run_btn, "#28A745")
+        stop_btn = tk.Button(
+            btn_fr, text="Stop", command=lambda p=panel: self.app.stop_with_mode(p),
+            bg="#DC3545", fg="white", activebackground="#C82333", activeforeground="white",
+            font=("Segoe UI", 9, "bold"), padx=8, pady=4, cursor="hand2", relief="flat", bd=0,
+        )
+        stop_btn.pack(side="left", padx=(0, 4))
+        add_hover_glow(stop_btn, "#DC3545")
+        switch_btn = tk.Button(
+            btn_fr, text="\u2192 Valve",
+            command=lambda i=panel.pump_index: self.app.switch_valve_to_pump(i),
+            bg="#3B82F6", fg="white", activebackground="#1E40AF", activeforeground="white",
+            font=("Segoe UI", 9, "bold"), padx=8, pady=4, cursor="hand2", relief="flat", bd=0,
+        )
+        switch_btn.pack(side="left")
+        add_hover_glow(switch_btn, "#3B82F6")
+
+        return {
+            "panel": panel,
+            "nick_var": nick_var,
+            "status_var": status_var,
+            "live_var": live_var,
+        }
+
+    # --- valve port buttons -------------------------------------------------
+
+    def _build_valve_port_buttons(self) -> None:
+        if self._valve_port_grid is None:
+            return
+        for child in self._valve_port_grid.winfo_children():
+            child.destroy()
+        self._valve_port_buttons = []
+        vp = self.app.valve_panel
+        try:
+            n = int(vp.max_ports_var.get().strip()) if vp is not None else 6
+        except ValueError:
+            n = 6
+        n = max(1, min(16, n))
+        cols = 6
+        for c in range(cols):
+            self._valve_port_grid.columnconfigure(c, weight=1)
+        for i in range(1, n + 1):
+            btn = tk.Button(
+                self._valve_port_grid,
+                text=str(i),
+                command=lambda p=i: self._move_valve(p),
+                bg="#3A3A50", fg="white", font=("Segoe UI", 9, "bold"),
+                relief="flat", bd=0, padx=4, pady=4, cursor="hand2",
+            )
+            r, c = divmod(i - 1, cols)
+            btn.grid(row=r, column=c, padx=2, pady=2, sticky="ew")
+            add_hover_glow(btn, "#3A3A50")
+            self._valve_port_buttons.append(btn)
+
+    def _highlight_valve_button(self, current: Optional[int]) -> None:
+        for i, btn in enumerate(self._valve_port_buttons, start=1):
+            try:
+                btn.configure(bg="#28A745" if current == i else "#3A3A50")
+            except tk.TclError:
+                pass
+
+    # --- public API used by the main app ------------------------------------
+
+    def rebuild(self) -> None:
+        self._build_pump_cards()
+        self._build_valve_port_buttons()
+
+    def refresh(self) -> None:
+        # Per-pump: pull values directly from each PumpPanel's vars.
+        for entry in self._pump_cards:
+            panel: PumpPanel = entry["panel"]
+            nick = panel.nickname_var.get().strip() or "(no nickname)"
+            entry["nick_var"].set(nick)
+            entry["status_var"].set(panel.status_var.get())
+            live = panel.live_readout_var.get()
+            entry["live_var"].set(live if live and live != "\u2014" else "—")
+
+        # Vacuum
+        vp = self.app.vacuum_panel
+        if vp is not None:
+            self._vac_bar_var.set(vp.bar_var.get() if hasattr(vp, "bar_var") else "Vacuum: --- bar")
+            self._vac_kpa_var.set(vp.kpa_var.get() if hasattr(vp, "kpa_var") else "--- kPa")
+            self._vac_inhg_var.set(vp.inhg_var.get() if hasattr(vp, "inhg_var") else "--- inHg")
+            self._vac_status_var.set(vp.status_var.get() if hasattr(vp, "status_var") else "—")
+            if self._vac_toggle_btn is not None:
+                if getattr(vp, "is_on", False):
+                    self._vac_toggle_btn.configure(text="Vacuum OFF", bg="#DC3545", activebackground="#C82333")
+                else:
+                    self._vac_toggle_btn.configure(text="Vacuum ON", bg="#28A745", activebackground="#218838")
+
+        # Valve
+        valve = self.app.valve_panel
+        if valve is not None:
+            self._valve_pos_var.set(valve.position_var.get())
+            self._valve_status_var.set(valve.conn_status_var.get())
+            try:
+                cur_text = valve.position_var.get()
+                if cur_text.startswith("Current port: "):
+                    cur = int(cur_text.split(":", 1)[1].strip())
+                    self._highlight_valve_button(cur)
+                else:
+                    self._highlight_valve_button(None)
+            except (ValueError, IndexError):
+                self._highlight_valve_button(None)
+
+    # --- button handlers ----------------------------------------------------
+
+    def _toggle_vacuum(self) -> None:
+        vp = self.app.vacuum_panel
+        if vp is not None:
+            vp.toggle_vacuum()
+
+    def _connect_vacuum(self) -> None:
+        vp = self.app.vacuum_panel
+        if vp is None:
+            return
+        if vp.serial_conn is not None and getattr(vp.serial_conn, "is_open", False):
+            return
+        vp.connect_arduino()
+
+    def _connect_valve(self) -> None:
+        valve = self.app.valve_panel
+        if valve is None:
+            return
+        if valve.is_connected:
+            return
+        valve.connect_async()
+
+    def _move_valve(self, port: int) -> None:
+        valve = self.app.valve_panel
+        if valve is None:
+            return
+        valve.move_to_port_async(port)
+
+
 class PumpControllerApp(tk.Tk):
+    PUMP_PANEL_WIDTH = 560
+    PUMP_PANEL_HEIGHT = 410
+    PUMPS_PER_ROW = 2
+
     def __init__(self) -> None:
         super().__init__()
-        self.title("Syringe Pumps Control (NE-1000)")
-        self.geometry("1180x830")
-        self.minsize(1080, 760)
+        self.title("Syringe Pumps Control (NE-1000) + Vacuum + RUNZE SV-07")
+        self.geometry("1280x900")
+        self.minsize(1100, 760)
+
+        (
+            loaded_num_pumps,
+            loaded_labels,
+            loaded_port_map,
+            loaded_port_labels,
+        ) = load_pump_labels_file()
+        self.num_pumps: int = loaded_num_pumps
+        self._loaded_labels: dict[str, str] = loaded_labels
+        # Live mapping used by the "Switch valve to this line" buttons and by
+        # ``valve_to_pump`` recipe steps. Seeded from ``pump_labels.json`` and
+        # overridden when a recipe is applied/run.
+        self._active_pump_port_map: dict[int, int] = dict(loaded_port_map)
+        self._saved_pump_port_map: dict[int, int] = dict(loaded_port_map)
+        # Custom labels for valve ports that are NOT pumps — vents, bleeds,
+        # waste, atmosphere, manual reservoirs, etc. Only one source: the
+        # global pump_labels.json (no per-recipe override for now).
+        self._active_port_labels: dict[int, str] = dict(loaded_port_labels)
+        self._saved_port_labels: dict[int, str] = dict(loaded_port_labels)
 
         self.mode_var = tk.StringVar(value="Individual mode")
         self.switch_together_var = tk.BooleanVar(value=False)
         self.dark_mode = False
         self.panels: list[PumpPanel] = []
         self.vacuum_panel: Optional[VacuumPanel] = None
+        self.valve_panel: Optional[ValvePanel] = None
         self.recipes_panel: Optional[RecipesPanel] = None
         self._recipes_window: Optional[tk.Toplevel] = None
         self._sequence_editor: Optional[RecipeSequenceEditor] = None
@@ -2556,18 +4063,19 @@ class PumpControllerApp(tk.Tk):
         self._quick_recipe_combo: Optional[ttk.Combobox] = None
         self._run_recipe_btn: Optional[tk.Button] = None
         self._abort_recipe_btn: Optional[ttk.Button] = None
-        self._resize_after_id: Optional[str] = None
-        self._body_frame: Optional[ttk.Frame] = None
-        self._last_wm_size: tuple[int, int] = (0, 0)
+        self._notebook: Optional[ttk.Notebook] = None
+        self._pumps_canvas: Optional[tk.Canvas] = None
+        self._pumps_inner: Optional[ttk.Frame] = None
+        self._custom_inlet_bar: Optional[ttk.Frame] = None
+        self._overview_tab: Optional["OverviewTab"] = None
+        self._num_pumps_var = tk.StringVar(value=str(self.num_pumps))
         self._style = ttk.Style(self)
         self._style.theme_use("clam")
         self._build()
         self._schedule_live_updates()
-        self.after(300, self._capture_initial_size)
-        self.bind("<Configure>", self._on_configure)
 
     def _build(self) -> None:
-        header = ttk.Frame(self, padding=12)
+        header = ttk.Frame(self, padding=(12, 12, 12, 6))
         header.pack(fill="x")
         self._header_frame = header
         ttk.Label(header, text="Mode").pack(side="left")
@@ -2580,6 +4088,17 @@ class PumpControllerApp(tk.Tk):
         ).pack(side="left", padx=(6, 16))
         ttk.Checkbutton(header, text="Switch Together", variable=self.switch_together_var).pack(side="left")
         ttk.Button(header, text="Refresh COM Ports", command=self.refresh_ports).pack(side="left", padx=(16, 0))
+        ttk.Label(header, text="Pumps:").pack(side="left", padx=(16, 4))
+        self._num_pumps_spin = ttk.Spinbox(
+            header,
+            from_=MIN_PUMPS,
+            to=MAX_PUMPS,
+            textvariable=self._num_pumps_var,
+            width=4,
+            command=self._on_num_pumps_spin,
+        )
+        self._num_pumps_spin.pack(side="left")
+        self._num_pumps_var.trace_add("write", lambda *_a: self._on_num_pumps_var_change())
         self.dark_mode_btn = ttk.Button(header, text="Dark Mode", command=self.toggle_dark_mode)
         self.dark_mode_btn.pack(side="left", padx=(16, 0))
 
@@ -2617,39 +4136,44 @@ class PumpControllerApp(tk.Tk):
         self._quick_recipe_combo.pack(side="right", padx=(0, 6))
         ttk.Label(header, text="Recipe:").pack(side="right", padx=(16, 4))
 
-        body = ttk.Frame(self, padding=(12, 0, 12, 12))
-        body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1, uniform="panel")
-        body.columnconfigure(1, weight=1, uniform="panel")
-        body.rowconfigure(0, weight=1, uniform="row")
-        body.rowconfigure(1, weight=1, uniform="row")
-        self._body_frame = body
-
         ports = detected_port_names()
-        self.panels.append(PumpPanel(body, self, 1, ports))
-        self.panels.append(PumpPanel(body, self, 2, ports))
-        self.panels.append(PumpPanel(body, self, 3, ports))
-        self.vacuum_panel = VacuumPanel(body, ports)
 
-        self.panels[0].grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 8))
-        self.panels[1].grid(row=0, column=1, sticky="nsew", pady=(0, 8))
-        self.panels[2].grid(row=1, column=0, sticky="nsew", padx=(0, 8))
-        self.vacuum_panel.grid(row=1, column=1, sticky="nsew")
+        self._notebook = ttk.Notebook(self)
+        self._notebook.pack(fill="both", expand=True, padx=12, pady=(0, 6))
 
-        for p in self.panels:
-            p.grid_propagate(False)
-        self.vacuum_panel.grid_propagate(False)
+        # --- Overview tab (compact summary, default landing page) ----------
+        overview_frame = ttk.Frame(self._notebook, padding=8)
+        self._notebook.add(overview_frame, text="Overview")
+        self._overview_tab = OverviewTab(overview_frame, self)
+        self._overview_tab.pack(fill="both", expand=True)
 
-        pl = load_pump_labels_file()
+        # --- Pumps tab (scrollable grid of PumpPanels) ---------------------
+        pumps_frame = ttk.Frame(self._notebook, padding=4)
+        self._notebook.add(pumps_frame, text="Pumps")
+        self._build_pumps_tab(pumps_frame, ports)
+
+        # --- Vacuum tab ----------------------------------------------------
+        vacuum_frame = ttk.Frame(self._notebook, padding=8)
+        self._notebook.add(vacuum_frame, text="Vacuum / Pressure")
+        self.vacuum_panel = VacuumPanel(vacuum_frame, ports)
+        self.vacuum_panel.pack(fill="both", expand=True)
+
+        # --- Selector Valve tab --------------------------------------------
+        valve_frame = ttk.Frame(self._notebook, padding=8)
+        self._notebook.add(valve_frame, text="Selector Valve")
+        self.valve_panel = ValvePanel(valve_frame, self, ports)
+        self.valve_panel.pack(fill="both", expand=True)
+
+        # Apply loaded nicknames to pump panels (loaded earlier in __init__).
         for i, panel in enumerate(self.panels):
-            panel.nickname_var.set(pl.get(str(i + 1), ""))
+            panel.nickname_var.set(self._loaded_labels.get(str(i + 1), ""))
             panel._refresh_frame_title()
 
         bottom_bar = ttk.Frame(self, padding=(12, 0, 12, 8))
         bottom_bar.pack(fill="x", side="bottom")
         self._tip_label = ttk.Label(
             bottom_bar,
-            text="Tip: you can type COM ports manually (e.g. COM3) even if no hardware is connected now.",
+            text="Tip: type COM ports manually (e.g. COM3) even without hardware connected.",
         )
         self._tip_label.pack(side="left", anchor="w")
 
@@ -2667,6 +4191,179 @@ class PumpControllerApp(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.refresh_quick_recipe_combo()
+        self._notebook.select(overview_frame)
+
+    def _build_pumps_tab(self, parent: ttk.Frame, ports: list[str]) -> None:
+        """Build a vertically scrollable grid container that holds N PumpPanels."""
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        # Row 0 = custom-inlets bar (sized to its content), row 1 = scrollable pumps area.
+        outer.rowconfigure(0, weight=0)
+        outer.rowconfigure(1, weight=1)
+        outer.columnconfigure(0, weight=1)
+
+        # --- Custom inlets quick-access bar (shown when port_labels is non-empty) -----
+        self._custom_inlet_bar = ttk.Frame(outer, padding=(4, 4, 4, 6))
+        self._custom_inlet_bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        # Buttons are populated lazily in _rebuild_custom_inlet_bar() so the
+        # frame is initially empty and shows nothing if no labels are set.
+
+        theme = DARK if self.dark_mode else LIGHT
+        canvas = tk.Canvas(outer, highlightthickness=0, bg=theme["bg"], borderwidth=0)
+        canvas.grid(row=1, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        sb.grid(row=1, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=sb.set)
+
+        inner = ttk.Frame(canvas)
+        inner_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def on_inner_configure(_e: Any = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def on_canvas_configure(event: tk.Event) -> None:
+            canvas.itemconfigure(inner_id, width=event.width)
+
+        inner.bind("<Configure>", on_inner_configure)
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        def _on_mousewheel(event: tk.Event) -> None:
+            try:
+                canvas.yview_scroll(int(-event.delta / 120), "units")
+            except tk.TclError:
+                pass
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        self._pumps_canvas = canvas
+        self._pumps_inner = inner
+
+        for i in range(self.num_pumps):
+            self.panels.append(PumpPanel(inner, self, i + 1, ports))
+        self._layout_pump_panels()
+        # Bar starts empty; gets populated as the user adds labels (via set_port_labels).
+        self._rebuild_custom_inlet_bar()
+
+    def _rebuild_custom_inlet_bar(self) -> None:
+        """Re-render the Custom inlets quick-access bar from ``_active_port_labels``."""
+        bar = getattr(self, "_custom_inlet_bar", None)
+        if bar is None:
+            return
+        for child in bar.winfo_children():
+            child.destroy()
+        labels = self._active_port_labels
+        if not labels:
+            ttk.Label(
+                bar,
+                text=("Custom inlets: none defined yet — set port labels on the "
+                      "Selector Valve tab to get one-click vent / waste / bleed buttons here."),
+                foreground="#888888",
+            ).pack(side="left")
+            return
+        ttk.Label(bar, text="Custom inlets:", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(2, 8))
+        for port in sorted(labels):
+            text = f"{labels[port]}  →  port {port}"
+            btn = tk.Button(
+                bar,
+                text=text,
+                command=lambda p=port: self._on_custom_inlet_click(p),
+                bg="#3B82F6",
+                fg="white",
+                activebackground="#1E40AF",
+                activeforeground="white",
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=4,
+                cursor="hand2",
+                relief="flat",
+                bd=0,
+            )
+            btn.pack(side="left", padx=(0, 6))
+            add_hover_glow(btn, "#3B82F6")
+
+    def _on_custom_inlet_click(self, port: int) -> None:
+        """Move the valve to a custom-inlet port; surface a friendly popup if not connected."""
+        vp = self.valve_panel
+        if vp is None:
+            return
+        if not vp.is_connected:
+            messagebox.showinfo(
+                "Switch valve",
+                "The selector valve is not connected. Open the Selector Valve tab and "
+                "click Connect Valve, then try again.",
+                parent=self,
+            )
+            return
+        vp.move_to_port_async(port)
+
+    def _layout_pump_panels(self) -> None:
+        if self._pumps_inner is None:
+            return
+        for child in self._pumps_inner.grid_slaves():
+            child.grid_forget()
+        cols = self.PUMPS_PER_ROW
+        for c in range(cols):
+            self._pumps_inner.columnconfigure(c, weight=1, uniform="ppanel")
+        for idx, panel in enumerate(self.panels):
+            r, c = divmod(idx, cols)
+            panel.configure(width=self.PUMP_PANEL_WIDTH, height=self.PUMP_PANEL_HEIGHT)
+            panel.grid_propagate(False)
+            panel.grid(row=r, column=c, sticky="nsew", padx=6, pady=6)
+        if self._pumps_canvas is not None:
+            self._pumps_canvas.update_idletasks()
+            self._pumps_canvas.configure(scrollregion=self._pumps_canvas.bbox("all"))
+
+    def _on_num_pumps_spin(self) -> None:
+        self._on_num_pumps_var_change()
+
+    def _on_num_pumps_var_change(self) -> None:
+        try:
+            n = int(self._num_pumps_var.get().strip())
+        except ValueError:
+            return
+        n = max(MIN_PUMPS, min(MAX_PUMPS, n))
+        if n == self.num_pumps:
+            return
+        self.set_num_pumps(n)
+
+    def set_num_pumps(self, new_n: int) -> None:
+        new_n = max(MIN_PUMPS, min(MAX_PUMPS, new_n))
+        if new_n == self.num_pumps:
+            return
+        if self._pumps_inner is None:
+            self.num_pumps = new_n
+            return
+        ports = detected_port_names()
+        if new_n > self.num_pumps:
+            for i in range(self.num_pumps, new_n):
+                self.panels.append(PumpPanel(self._pumps_inner, self, i + 1, ports))
+        else:
+            for panel in self.panels[new_n:]:
+                try:
+                    if panel.connection.pump is not None:
+                        panel.disconnect_sync()
+                except Exception:
+                    pass
+                try:
+                    panel.destroy()
+                except tk.TclError:
+                    pass
+            self.panels = self.panels[:new_n]
+        self.num_pumps = new_n
+        self._num_pumps_var.set(str(new_n))
+        self._layout_pump_panels()
+        if self._overview_tab is not None:
+            try:
+                self._overview_tab.rebuild()
+            except tk.TclError:
+                pass
+        if self.valve_panel is not None:
+            try:
+                self.valve_panel.refresh_mapping_table()
+            except tk.TclError:
+                pass
+        self.schedule_save_pump_labels()
 
     def refresh_quick_recipe_combo(self) -> None:
         """Reload saved recipes into the main toolbar drop-down."""
@@ -2683,27 +4380,6 @@ class PumpControllerApp(tk.Tk):
                 self._quick_recipe_var.set(labels[0])
         else:
             self._quick_recipe_var.set("")
-
-    def _capture_initial_size(self) -> None:
-        self._last_wm_size = (self.winfo_width(), self.winfo_height())
-
-    def _on_configure(self, event: Any) -> None:
-        if event.widget is not self:
-            return
-        new_size = (event.width, event.height)
-        if new_size == self._last_wm_size:
-            return
-        self._last_wm_size = new_size
-        if self._body_frame is not None and self._body_frame.winfo_ismapped():
-            self._body_frame.pack_forget()
-        if self._resize_after_id is not None:
-            self.after_cancel(self._resize_after_id)
-        self._resize_after_id = self.after(80, self._finish_resize)
-
-    def _finish_resize(self) -> None:
-        self._resize_after_id = None
-        if self._body_frame is not None and not self._body_frame.winfo_ismapped():
-            self._body_frame.pack(after=self._header_frame, fill="both", expand=True)
 
     def _show_progress_bar(self, total_seconds: float, *, unknown_duration: bool = False) -> None:
         self._recipe_progress_pause_accum = 0.0
@@ -2777,7 +4453,7 @@ class PumpControllerApp(tk.Tk):
         steps = recipe.get("steps")
         is_sequence = isinstance(steps, list) and len(steps) > 0
         est_time = _estimate_recipe_time(recipe) if is_sequence else 0.0
-        pumps_used, vacuum_needed = _recipe_resources(recipe)
+        pumps_used, vacuum_needed, valve_needed = _recipe_resources(recipe)
         nicks = self.pump_nickname_map()
 
         theme = DARK if self.dark_mode else LIGHT
@@ -2800,9 +4476,8 @@ class PumpControllerApp(tk.Tk):
 
         cards = ttk.Frame(outer)
         cards.pack(fill="x", pady=(0, 8))
-        cards.columnconfigure(0, weight=1, uniform="card")
-        cards.columnconfigure(1, weight=1, uniform="card")
-        cards.columnconfigure(2, weight=1, uniform="card")
+        for c in range(4):
+            cards.columnconfigure(c, weight=1, uniform="card")
 
         def _card(parent: ttk.Frame, col: int, title_text: str, body_text: str) -> None:
             fr = ttk.LabelFrame(parent, text=title_text, padding=8)
@@ -2815,7 +4490,8 @@ class PumpControllerApp(tk.Tk):
         ) if pumps_used else "(none detected)"
         _card(cards, 0, "PUMPS", pump_desc)
         _card(cards, 1, "VACUUM", "Required" if vacuum_needed else "Not used")
-        _card(cards, 2, "STEPS", f"{len(steps)} steps" if is_sequence else "Apply + Run")
+        _card(cards, 2, "VALVE", "Required" if valve_needed else "Not used")
+        _card(cards, 3, "STEPS", f"{len(steps)} steps" if is_sequence else "Apply + Run")
 
         if is_sequence:
             ttk.Label(outer, text="Steps:", font=("Segoe UI", 10, "bold")).pack(anchor="w", pady=(4, 2))
@@ -2933,7 +4609,7 @@ class PumpControllerApp(tk.Tk):
         self._recipe_gui_poll_tick()
 
     def abort_recipe_run(self) -> None:
-        """Stop the recipe UI immediately, signal the worker, stop pumps/vacuum, then reinitialize."""
+        """Stop the recipe UI immediately, signal the worker, stop pumps/vacuum/valve."""
         if not self._recipe_thread_running:
             return
         self._recipe_abort_event.set()
@@ -2952,6 +4628,12 @@ class PumpControllerApp(tk.Tk):
             except tk.TclError:
                 pass
             vp._set_status("Vacuum OFF (recipe aborted)")
+        valve = self.valve_panel
+        if valve is not None:
+            try:
+                valve._set_motion("Recipe aborted")
+            except tk.TclError:
+                pass
         self._finish_recipe_run(ftb, name, user_aborted=True, had_error=False)
         threading.Thread(target=self._abort_stop_hardware_motion, daemon=True).start()
         if self._abort_reinit_after is not None:
@@ -2963,7 +4645,7 @@ class PumpControllerApp(tk.Tk):
         self._abort_reinit_after = self.after(200, self._reinitialize_after_abort)
 
     def _abort_stop_hardware_motion(self) -> None:
-        """Best-effort stop syringe pumps and send vacuum OFF (runs on a background thread)."""
+        """Best-effort stop pumps, vacuum, and valve motion (runs on a background thread)."""
         for panel in self.panels:
             if panel.connection.pump is None:
                 continue
@@ -2972,23 +4654,29 @@ class PumpControllerApp(tk.Tk):
             except Exception:
                 pass
         vp = self.vacuum_panel
-        if vp is None:
-            return
-        try:
-            with vp._serial_lock:
-                conn = vp.serial_conn
-                if conn is not None and getattr(conn, "is_open", False):
-                    try:
-                        conn.write(b"0")
-                        conn.flush()
-                    except Exception:
-                        pass
-                vp.is_on = False
-        except Exception:
-            pass
+        if vp is not None:
+            try:
+                with vp._serial_lock:
+                    conn = vp.serial_conn
+                    if conn is not None and getattr(conn, "is_open", False):
+                        try:
+                            conn.write(b"0")
+                            conn.flush()
+                        except Exception:
+                            pass
+                    vp.is_on = False
+            except Exception:
+                pass
+        valve = self.valve_panel
+        if valve is not None and valve.driver is not None and valve.driver.is_open:
+            try:
+                with valve._serial_lock:
+                    valve.driver.force_stop()
+            except Exception:
+                pass
 
     def _reinitialize_after_abort(self) -> None:
-        """Disconnect pumps and vacuum on the main thread after an abort (fresh \"not connected\" state)."""
+        """Disconnect pumps, vacuum, and valve on the main thread after an abort."""
         self._abort_reinit_after = None
         if self._recipe_thread_running:
             return
@@ -3004,6 +4692,11 @@ class PumpControllerApp(tk.Tk):
         if self.vacuum_panel is not None:
             try:
                 self.vacuum_panel.close_serial_sync()
+            except Exception:
+                pass
+        if self.valve_panel is not None:
+            try:
+                self.valve_panel.close_serial_sync()
             except Exception:
                 pass
 
@@ -3090,7 +4783,12 @@ class PumpControllerApp(tk.Tk):
 
     def _flush_pump_labels_to_file(self) -> None:
         self._save_pump_labels_job = None
-        save_pump_labels_file({str(i + 1): p.nickname_var.get().strip() for i, p in enumerate(self.panels)})
+        save_pump_labels_file(
+            self.num_pumps,
+            {str(i + 1): p.nickname_var.get().strip() for i, p in enumerate(self.panels)},
+            pump_port_map=self._saved_pump_port_map,
+            port_labels=self._saved_port_labels,
+        )
 
     def pump_nickname_map(self) -> dict[int, str]:
         return {
@@ -3099,11 +4797,105 @@ class PumpControllerApp(tk.Tk):
             if p.nickname_var.get().strip()
         }
 
+    def set_pump_port_mapping(
+        self,
+        new_map: dict[int, int],
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Update the live pump→valve-port mapping.
+
+        When ``persist`` is True (default), also remember it as the saved default
+        in ``pump_labels.json`` so it survives restarts. Recipe-driven calls pass
+        ``persist=False`` so a recipe override doesn't clobber the user's
+        global mapping.
+        """
+        cleaned = _coerce_pump_port_map(new_map)
+        self._active_pump_port_map = dict(cleaned)
+        if persist:
+            self._saved_pump_port_map = dict(cleaned)
+            self.schedule_save_pump_labels()
+        if self.valve_panel is not None:
+            try:
+                self.valve_panel.refresh_mapping_table()
+                # Hints in the labels table show "(Pump N)" next to each port
+                # if a pump is mapped there — keep them current.
+                self.valve_panel.refresh_label_table()
+                self.valve_panel.refresh_port_button_text()
+            except tk.TclError:
+                pass
+
+    def set_port_labels(
+        self,
+        new_labels: dict[int, str],
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Update the live custom port labels (vents/bleeds/waste/etc.).
+
+        ``persist=True`` writes them to ``pump_labels.json`` (the labels are
+        considered physical-wiring info, so there's no recipe override path).
+        """
+        cleaned = _coerce_port_labels(new_labels)
+        self._active_port_labels = dict(cleaned)
+        if persist:
+            self._saved_port_labels = dict(cleaned)
+            self.schedule_save_pump_labels()
+        if self.valve_panel is not None:
+            try:
+                self.valve_panel.refresh_label_table()
+                self.valve_panel.refresh_port_button_text()
+            except tk.TclError:
+                pass
+        try:
+            self._rebuild_custom_inlet_bar()
+        except tk.TclError:
+            pass
+
+    def port_assignment_text(self, port: int) -> str:
+        """Return a short label describing what is wired to ``port``.
+
+        Pump mapping wins over a custom label; if neither, returns ``""``.
+        """
+        for pump_index, mapped_port in self._active_pump_port_map.items():
+            if mapped_port == port:
+                if 1 <= pump_index <= len(self.panels):
+                    nick = self.panels[pump_index - 1].nickname_var.get().strip()
+                    if nick:
+                        return nick
+                return f"Pump {pump_index}"
+        return self._active_port_labels.get(port, "")
+
+    def valve_connection_snapshot(self) -> Optional[dict[str, Any]]:
+        """Return the current valve panel's connection settings, or ``None`` if no panel."""
+        vp = self.valve_panel
+        if vp is None:
+            return None
+        com = vp.com_var.get().strip()
+        if not com:
+            return None
+        try:
+            baud = int(vp.baud_var.get().strip())
+        except ValueError:
+            baud = 9600
+        try:
+            addr = int(vp.addr_var.get().strip())
+        except ValueError:
+            addr = 0
+        try:
+            mp = int(vp.max_ports_var.get().strip())
+        except ValueError:
+            mp = 6
+        return {"com": com, "baud": baud, "address": addr, "max_ports": mp}
+
     def apply_recipe_to_panels(self, recipe: dict[str, Any]) -> None:
-        """Copy saved COM/baud/address and pump1–pump3 parameter dicts into the main panels."""
+        """Copy saved COM/baud/address, per-pump settings, valve config, and port mapping."""
+        target_n = recipe_num_pumps(recipe)
+        if target_n != self.num_pumps:
+            self.set_num_pumps(target_n)
+
         for i, panel in enumerate(self.panels):
-            ckey = f"pump{i + 1}_conn"
-            conn = recipe.get(ckey)
+            conn = recipe_pump_conn(recipe, i + 1)
             if isinstance(conn, dict):
                 com = str(conn.get("com", "")).strip()
                 try:
@@ -3118,8 +4910,7 @@ class PumpControllerApp(tk.Tk):
                 panel.baud_var.set(str(baud))
                 panel.address_var.set(str(addr))
         for i, panel in enumerate(self.panels):
-            key = f"pump{i + 1}"
-            data = recipe.get(key)
+            data = recipe_pump_settings(recipe, i + 1)
             if isinstance(data, dict):
                 panel.apply_settings_from_snapshot(data)
         pl = recipe.get("pump_labels")
@@ -3131,6 +4922,37 @@ class PumpControllerApp(tk.Tk):
                     panel._refresh_frame_title()
             self.schedule_save_pump_labels()
 
+        vc = recipe_valve_conn(recipe)
+        if isinstance(vc, dict) and self.valve_panel is not None:
+            com = str(vc.get("com", "")).strip()
+            if com:
+                self.valve_panel.com_var.set(com)
+            try:
+                baud = int(vc.get("baud", 9600))
+                self.valve_panel.baud_var.set(str(baud))
+            except (TypeError, ValueError):
+                pass
+            try:
+                addr = int(vc.get("address", 0))
+                self.valve_panel.addr_var.set(str(addr))
+            except (TypeError, ValueError):
+                pass
+            try:
+                mp = int(vc.get("max_ports", 6))
+                self.valve_panel.max_ports_var.set(str(mp))
+                self.valve_panel._rebuild_port_grid()
+            except (TypeError, ValueError):
+                pass
+
+        rp_map = recipe_pump_port_map(recipe)
+        if rp_map:
+            # A recipe override should drive the live "Switch valve" buttons but
+            # not silently overwrite the user's saved global mapping.
+            self.set_pump_port_mapping(rp_map, persist=False)
+        elif self.valve_panel is not None:
+            # Fall back to the persisted global mapping so the table never goes blank.
+            self.set_pump_port_mapping(self._saved_pump_port_map, persist=False)
+
     def run_recipe_sequence(self, recipe: dict[str, Any], *, from_toolbar: bool = False) -> None:
         """Execute ordered steps (delays, pump connect/apply/run, vacuum) on a background thread."""
         steps = recipe.get("steps")
@@ -3139,6 +4961,24 @@ class PumpControllerApp(tk.Tk):
         if self._recipe_thread_running:
             messagebox.showwarning("Recipe", "A recipe is already running. Abort it first or wait until it finishes.", parent=self)
             return
+
+        # Make sure the panel grid matches the recipe's expected pump count *before* we run.
+        # This way per-recipe pump-port mappings line up with the actual pumps the user is
+        # about to use.
+        target_n = recipe_num_pumps(recipe)
+        if target_n != self.num_pumps:
+            self.set_num_pumps(target_n)
+
+        # Pre-load the per-recipe pump-port mapping so valve_to_pump steps and
+        # the "Switch valve" buttons share the same source of truth during this run.
+        rp_map = recipe_pump_port_map(recipe)
+        if rp_map:
+            self.set_pump_port_mapping(rp_map, persist=False)
+        else:
+            # No recipe-specific mapping → use the persisted global default so
+            # users don't have to re-enter ports for every recipe.
+            self.set_pump_port_mapping(self._saved_pump_port_map, persist=False)
+        port_map_snapshot = dict(self._active_pump_port_map)
 
         recipe_name = recipe.get("name", "")
         est = _estimate_recipe_time(recipe)
@@ -3153,12 +4993,14 @@ class PumpControllerApp(tk.Tk):
         abort = self._recipe_abort_event
         app = self
         nicks = self.pump_nickname_map()
+        max_pumps_now = len(self.panels)
 
         def worker() -> None:
             had_error = False
             was_aborted = False
             try:
                 vac = app.vacuum_panel
+                valve = app.valve_panel
                 for idx, step in enumerate(steps):
                     if abort.is_set():
                         was_aborted = True
@@ -3174,8 +5016,8 @@ class PumpControllerApp(tk.Tk):
                                 return
                         elif st == "connect_pump":
                             p = int(step["pump"])
-                            if p not in (1, 2, 3):
-                                raise ValueError(f"Invalid pump {p}")
+                            if p < 1 or p > max_pumps_now:
+                                raise ValueError(f"Invalid pump {p} (1..{max_pumps_now} available)")
                             panel = app.panels[p - 1]
                             com = str(step["com"]).strip()
                             baud = int(step["baud"])
@@ -3196,9 +5038,12 @@ class PumpControllerApp(tk.Tk):
                             panel.connect_with_params(com, baud, addr)
                         elif st == "disconnect_pump":
                             p = int(step["pump"])
-                            app.panels[p - 1].disconnect_sync()
+                            if 1 <= p <= max_pumps_now:
+                                app.panels[p - 1].disconnect_sync()
                         elif st == "apply_pump":
                             p = int(step["pump"])
+                            if p < 1 or p > max_pumps_now:
+                                raise ValueError(f"Invalid pump {p}")
                             panel = app.panels[p - 1]
                             settings = step.get("settings")
                             if not isinstance(settings, dict):
@@ -3217,7 +5062,7 @@ class PumpControllerApp(tk.Tk):
                             panel.apply_settings_sync()
                         elif st == "line_check":
                             p = int(step["pump"])
-                            if p not in (1, 2, 3):
+                            if p < 1 or p > max_pumps_now:
                                 raise ValueError(f"Invalid pump {p}")
                             if abort.is_set():
                                 was_aborted = True
@@ -3230,6 +5075,8 @@ class PumpControllerApp(tk.Tk):
                                 return
                         elif st == "run_pump":
                             p = int(step["pump"])
+                            if p < 1 or p > max_pumps_now:
+                                raise ValueError(f"Invalid pump {p}")
                             panel = app.panels[p - 1]
                             if abort.is_set():
                                 was_aborted = True
@@ -3243,7 +5090,8 @@ class PumpControllerApp(tk.Tk):
                                 return
                         elif st == "stop_pump":
                             p = int(step["pump"])
-                            app.panels[p - 1].stop_sync()
+                            if 1 <= p <= max_pumps_now:
+                                app.panels[p - 1].stop_sync()
                         elif st == "vacuum_connect":
                             if vac is None:
                                 raise RuntimeError("Vacuum panel not available")
@@ -3273,6 +5121,74 @@ class PumpControllerApp(tk.Tk):
                             if vac is None:
                                 raise RuntimeError("Vacuum panel not available")
                             vac.send_vacuum_sync(False)
+                        elif st == "valve_connect":
+                            if valve is None:
+                                raise RuntimeError("Valve panel not available")
+                            com = str(step["com"]).strip()
+                            baud = int(step.get("baud", 9600))
+                            addr = int(step.get("address", 0))
+                            mp_raw = step.get("max_ports")
+                            mp = int(mp_raw) if mp_raw is not None else None
+                            if abort.is_set():
+                                was_aborted = True
+                                return
+                            valve.open_serial_explicit(com, baud=baud, address=addr, max_ports=mp)
+                        elif st == "valve_disconnect":
+                            if valve is not None:
+                                valve.close_serial_sync()
+                        elif st == "valve_to_port":
+                            if valve is None:
+                                raise RuntimeError("Valve panel not available — add a 'Valve connect' step.")
+                            port = int(step["port"])
+                            if abort.is_set():
+                                was_aborted = True
+                                return
+                            result = valve.move_to_port_sync(port, abort=abort)
+                            if result < 0:
+                                was_aborted = True
+                                return
+                        elif st == "valve_to_pump":
+                            if valve is None:
+                                raise RuntimeError("Valve panel not available — add a 'Valve connect' step.")
+                            p = int(step["pump"])
+                            port = port_map_snapshot.get(p)
+                            if port is None:
+                                raise RuntimeError(
+                                    f"No pump-to-port mapping for pump {p}. Open the recipe's "
+                                    f"sequence editor and use 'Pump↔Port mapping…' to set it."
+                                )
+                            if abort.is_set():
+                                was_aborted = True
+                                return
+                            result = valve.move_to_port_sync(port, abort=abort)
+                            if result < 0:
+                                was_aborted = True
+                                return
+                        elif st == "valve_to_label":
+                            if valve is None:
+                                raise RuntimeError("Valve panel not available — add a 'Valve connect' step.")
+                            wanted = str(step.get("label", "")).strip()
+                            if not wanted:
+                                raise RuntimeError("valve_to_label step has an empty label.")
+                            # Resolve label → port at run time so the latest custom labels apply.
+                            wanted_lc = wanted.casefold()
+                            port = None
+                            for cand_port, cand_label in app._active_port_labels.items():
+                                if cand_label.strip().casefold() == wanted_lc:
+                                    port = cand_port
+                                    break
+                            if port is None:
+                                raise RuntimeError(
+                                    f"No port labelled '{wanted}'. Open the Selector Valve "
+                                    f"tab and add it under 'Custom port labels'."
+                                )
+                            if abort.is_set():
+                                was_aborted = True
+                                return
+                            result = valve.move_to_port_sync(port, abort=abort)
+                            if result < 0:
+                                was_aborted = True
+                                return
                         else:
                             raise ValueError(f"Unknown step type: {st}")
                     except RecipeAbort:
@@ -3470,6 +5386,8 @@ class PumpControllerApp(tk.Tk):
             panel.update_port_choices(ports)
         if self.vacuum_panel is not None:
             self.vacuum_panel.update_port_choices(ports)
+        if self.valve_panel is not None:
+            self.valve_panel.update_port_choices(ports)
         if ports:
             messagebox.showinfo("COM Ports", "Detected: " + ", ".join(ports), parent=self)
         else:
@@ -3486,8 +5404,44 @@ class PumpControllerApp(tk.Tk):
                     panel.after(0, lambda p=panel: p.set_status("Powered off / stopped"))
             if self.vacuum_panel is not None:
                 self.vacuum_panel.force_off()
+            if self.valve_panel is not None:
+                vd = self.valve_panel.driver
+                if vd is not None and vd.is_open:
+                    try:
+                        with self.valve_panel._serial_lock:
+                            vd.force_stop()
+                    except Exception:
+                        pass
 
         threading.Thread(target=work, daemon=True).start()
+
+    def switch_valve_to_pump(self, pump_index: int) -> None:
+        """Move the selector valve to whichever port the active recipe (or last applied)
+        has mapped to *pump_index*. Shows a popup if no mapping is available."""
+        vp = self.valve_panel
+        if vp is None:
+            return
+        port = self._active_pump_port_map.get(pump_index)
+        if port is None:
+            messagebox.showinfo(
+                "Switch valve",
+                f"No valve port is mapped to Pump {pump_index} yet.\n\n"
+                f"Open the Selector Valve tab and fill in the "
+                f"'Pump → Valve port' table to tell the app which line "
+                f"each pump is plumbed to. (Recipe-specific overrides can "
+                f"still be set per-recipe in the sequence editor.)",
+                parent=self,
+            )
+            return
+        if not vp.is_connected:
+            messagebox.showinfo(
+                "Switch valve",
+                "The selector valve is not connected. Open the Selector Valve tab and "
+                "click Connect Valve, then try again.",
+                parent=self,
+            )
+            return
+        vp.move_to_port_async(port)
 
     def toggle_dark_mode(self) -> None:
         self.dark_mode = not self.dark_mode
@@ -3501,6 +5455,11 @@ class PumpControllerApp(tk.Tk):
                 fg=theme["fg"],
                 activebackground=theme["btn_hover"],
             )
+        if self._pumps_canvas is not None:
+            try:
+                self._pumps_canvas.configure(bg=theme["bg"])
+            except tk.TclError:
+                pass
         if self._recipes_window is not None:
             try:
                 if self._recipes_window.winfo_exists():
@@ -3520,6 +5479,17 @@ class PumpControllerApp(tk.Tk):
         for panel in self.panels:
             panel.update_time_display()
             panel.maybe_poll_live_status()
+        if self._overview_tab is not None:
+            try:
+                self._overview_tab.refresh()
+            except tk.TclError:
+                pass
+        if self.valve_panel is not None:
+            try:
+                self.valve_panel.refresh_mapping_nicknames()
+                self.valve_panel.refresh_port_button_text()
+            except tk.TclError:
+                pass
         self.after(1000, self._schedule_live_updates)
 
     def on_close(self) -> None:
@@ -3528,6 +5498,11 @@ class PumpControllerApp(tk.Tk):
             panel.connection.close()
         if self.vacuum_panel is not None:
             self.vacuum_panel.close()
+        if self.valve_panel is not None:
+            try:
+                self.valve_panel.close()
+            except Exception:
+                pass
         if self._sequence_editor is not None:
             try:
                 self._sequence_editor.destroy()

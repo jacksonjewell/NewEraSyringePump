@@ -1,5 +1,8 @@
 {
-  "1": "Hexadecane",
-  "2": "testing",
-  "3": "Buffer"
+  "num_pumps": 3,
+  "pumps": {
+    "1": "Hexadecane",
+    "2": "testing",
+    "3": "Buffer"
+  }
 }
