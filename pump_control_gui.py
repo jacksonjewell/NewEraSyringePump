@@ -6004,11 +6004,23 @@ class PumpControllerApp(tk.Tk):
     def _run_group_action(self, source_panel: PumpPanel, action_name: str) -> None:
         targets = self._targets_for_action(source_panel)
         snapshot = source_panel.snapshot_settings()
+        app = self
 
         def work() -> None:
             for panel in targets:
                 if panel is not source_panel:
-                    panel.after(0, lambda p=panel: p.apply_settings_from_snapshot(snapshot))
+                    # Block the worker until the GUI thread has actually
+                    # written the source's settings into this target panel.
+                    # A fire-and-forget after(0, …) here would let
+                    # apply_settings_sync below read the target's previous,
+                    # stale rate/volume — programming the target pump with
+                    # the WRONG settings (potentially a 100× overdose on a
+                    # syringe pump). Mirrors the pattern used in
+                    # run_recipe_sequence.
+                    run_on_main_thread(
+                        app,
+                        lambda p=panel, s=snapshot: p.apply_settings_from_snapshot(s),
+                    )
                 if action_name == "apply":
                     panel.apply_settings_sync()
                     panel.after(0, lambda p=panel: p.set_status("Settings applied"))
