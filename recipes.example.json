@@ -159,6 +159,20 @@
           "type": "vacuum_disconnect"
         },
         {
+          "type": "valve_connect",
+          "com": "COM8",
+          "baud": 9600,
+          "address": 0,
+          "max_ports": 6
+        },
+        {
+          "type": "valve_to_port",
+          "port": 2
+        },
+        {
+          "type": "valve_disconnect"
+        },
+        {
           "type": "disconnect_pump",
           "pump": 1
         }

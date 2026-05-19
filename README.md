@@ -41,7 +41,7 @@ All)**) stays visible on every tab.
 - **Dispense modes**: Continuous or Volume. In **Volume** mode a volume entry plus
   a **unit selector** (uL / mL / L) appear next to the Dispense Mode dropdown.
 - **Direction**: Infuse / Withdraw
-- **Live status**: volume dispensed, total volume, elapsed time (~1 s polling)
+- **Live status**: volume dispensed, total volume, elapsed time (~1 s polling), on its own row under the panel title so it stays visible
 - **Volume display units**: per-pump **Display as** dropdown (uL, mL, L)
 - **Action buttons**: **Pump Auto-Connect** + **Apply pump settings** (yellow) on
   one row; **Run** (green) and **Stop** (red) on the next row; a full-width
@@ -86,7 +86,8 @@ All)**) stays visible on every tab.
 ### Pump → Valve port mapping (live, in-tab)
 
 The **Selector Valve** tab has a **Pump → Valve port** table that lets you set,
-right there, which valve port each pump's tubing is plumbed to:
+right there, which valve port each pump's tubing is plumbed to (the live
+default used when no recipe has overridden `pump_port_map`):
 
 - One row per pump, with a port spinner (1–16) and a **Clear** button.
 - Saves automatically to `pump_labels.json` (`pump_port_map`); a green
@@ -109,50 +110,93 @@ bleed lines, vents, waste, atmospheric inlet, manual reservoirs, etc.
 - Labels appear on the **Move to port** buttons of the valve grid and on
   the **Custom inlets** bar at the top of the Pumps tab (one button per
   labeled port, one click moves the valve there).
-- Use the new **`valve_to_label`** recipe step to switch to a labeled
+- Use the **`valve_to_label`** recipe step to switch to a labeled
   port by name (e.g. *Vent to atmosphere*) — resolved to a port at run
   time, so you can rewire without rewriting recipes.
 
 ### Recipes
 
 The Recipes window (toolbar **Recipes…**) saves the current state of **every
-pump panel currently shown**, the valve connection (if connected), labels, and
-optional sequence steps. Stored in `recipes.json` next to the script.
+pump panel currently shown**, the valve connection snapshot (from the Selector
+Valve tab when you save), labels, **per-recipe** `pump_port_map`, and optional
+sequence steps. Stored in **`recipes.json`** next to the script.
 
-#### New step types
+Two ways to execute:
 
-In addition to the existing pump / vacuum / delay / line-check steps, sequences
-can now include:
+- **Apply + Run all** — no `steps`: loads settings and runs every **already
+  connected** pump (good for simple “run my rates” setups).
+- **Run sequence** — recipe has `steps`: runs them **in strict order**: connect,
+  vacuum ON/OFF, valve connect, valve moves, apply/run/stop pumps, delays, etc.
+
+#### Sequence editor (**Edit sequence…**)
+
+The floating **Sequence — …** window is where ordered protocols are authored.
+
+| Area | Contents |
+|------|----------|
+| **Add step** groups | **Pumps** · **Vacuum (Arduino)** · **Selector valve (SV-07)** · one **Disconnect everything** button for end-of-protocol cleanup |
+| Placement | Controls are intentionally **above** the step **list**, so valve buttons (**Valve connect…**, **Valve → port…**, etc.) stay on screen regardless of window size |
+| **Pump↔Port mapping…** | Opens the per-recipe pump→valve port table (below) |
+
+**Selector valve in sequences:** add a **`valve_connect`** step (with the same
+COM/baud/address/`max_ports` you use on the valve tab) **before** any
+`valve_to_port` / `valve_to_pump` / `valve_to_label` step. Use **Valve → port…**
+for a numbered port (the dialog lists **custom labels** from the live Selector
+Valve tab and respects **max ports**), **Valve → line for pump…** for the
+per-recipe map, or **Valve → custom inlet…** to match a **Custom port label**
+by name.
+
+**Timed pumping in Continuous mode:** `run_pump` returns immediately in
+Continuous mode — add a **`delay`** for the run duration, then **`stop_pump`**
+(or use **Volume** mode so `run_pump` blocks until the volume is done).
+
+#### Per-recipe pump-to-port mapping
+
+Each recipe can store its own **`pump_port_map`** (e.g. Pump 2 → valve port 5).
+That map is used by **Valve → line for pump N** recipe steps and by the main
+window’s **→ Switch valve to this line** buttons while the recipe’s mapping is
+active during a sequence run.
+
+The **Pump↔Port mapping…** dialog:
+
+- Has **one editable row per pump** in your current layout (not one row per
+  physical rotor port — vents, bleeds, sealed caps, etc. are not “pumps”).
+- Shows a **read-only reference list of all ports 1…N** (N = max ports from the
+  live Selector Valve panel) with **Custom port labels** when set, so you can see
+  the full rotor at a glance while assigning pump lines.
+- Validates port numbers against that same **N** (not a flat 1–16 when the valve
+  is configured for fewer ports).
+
+Non-pump lines are still switched with **Valve → port…** or **Valve → custom
+inlet…**; configure names on **Selector Valve → Custom port labels**.
+
+#### Step types (sequences)
+
+In addition to pump / vacuum / delay / `line_check` steps, sequences can
+include:
 
 | `type` | Description |
 |--------|-------------|
 | `valve_connect` | Open the SV-07 serial port (`com`, `baud`, `address`, `max_ports`) |
 | `valve_disconnect` | Close the SV-07 serial port |
-| `valve_to_port` | Move the valve to a specific port number (`port`) and wait until idle |
-| `valve_to_pump` | Move the valve to whichever port the recipe's per-recipe `pump_port_map` has assigned to that pump (`pump`). This is the natural drop-in for the old `line_check` step — automatic instead of operator-confirmed. |
-| `valve_to_label` | Move the valve to whichever port has a matching custom label (`label`). Resolved at run time from `pump_labels.json` `port_labels` (case-insensitive, trimmed) — perfect for `Vent to atmosphere`, `Waste line`, etc. The sequence-editor button is **Valve → custom inlet…**. |
+| `valve_to_port` | Move the valve to port `port` (1…N for your configured `max_ports`) and wait until idle |
+| `valve_to_pump` | Move the valve to the port listed in the recipe’s `pump_port_map` for that `pump` index |
+| `valve_to_label` | Move to the port whose **Custom port label** matches `label` (case-insensitive, trimmed; from live `port_labels` while running) |
+| `disconnect_everything` | Best-effort: stop connected pumps, vacuum OFF, close vacuum + valve serial, disconnect all pump panels |
 
-The legacy `line_check` step still works for backward compatibility (operator
-confirms a popup before the next step).
+The legacy **`line_check`** step still works (operator confirms a popup before
+the next step).
 
-#### Per-recipe pump-to-port mapping
+#### Recipe runner behavior
 
-Each recipe stores its own `pump_port_map` (e.g. Pump 2 → Valve port 5). Edit it
-from the sequence editor's **Pump↔Port mapping…** button, which opens a small
-table you can fill in for every pump. The **→ Switch valve to this line** button
-on each pump panel and the **valve_to_pump** step both consult this map at
-runtime.
-
-#### Recipe runner improvements
-
-- The pre-run confirmation dialog now shows a **VALVE: Required / Not used** card
-  alongside the existing PUMPS / VACUUM / STEPS cards.
-- The runner detects when a recipe's `num_pumps` differs from the current panel
-  grid and resizes the grid before applying any settings, so per-recipe pump
-  numbering always matches.
-- Friendly error messages cover the new valve failure modes (port not open,
-  bad checksum, missing pump-port mapping, motor timeout, etc.).
-- Estimated time accounts for valve moves (~3 s budget per move).
+- The pre-run confirmation dialog shows **PUMPS / VACUUM / VALVE / STEPS** summary
+  cards for sequences.
+- The runner resizes the pump grid to the recipe’s `num_pumps` before running
+  when needed.
+- Friendly error messages cover valve failures (port not open, checksum,
+  missing `pump_port_map` for `valve_to_pump`, unknown `valve_to_label`, motor
+  timeout, etc.).
+- Estimated time budgets ~3 s per valve move for the progress bar.
 
 ### Other
 
@@ -204,7 +248,7 @@ py -3 -m venv .venv
 |------|---------|
 | `recipes.json` | Saved recipes / sequences. **Committed** so you can pull the same recipes on another machine. Contains COM port names — edit after pull if hardware differs. |
 | `pump_labels.json` | Pump nicknames, chosen pump count (`num_pumps`), live pump→valve-port mapping (`pump_port_map`), and custom port labels (`port_labels`). **Committed** for the same reason. |
-| **`recipes.example.json`** | Reference / template for the JSON shape. |
+| **`recipes.example.json`** | Reference template; the “with sequence” recipe includes sample **valve** steps (`valve_connect`, `valve_to_port`, `valve_disconnect`) after the vacuum block. |
 
 After you change recipes or nicknames in the GUI, run **`.\push_recipes.ps1`**
 (or `git add` / `commit` / `push` those two files yourself) so the other machine
@@ -293,9 +337,10 @@ Optional `label` annotates the step in the editor list.
 | `vacuum_off` | *(none)* |
 | `valve_connect` | `com`, `baud`, `address`, `max_ports` |
 | `valve_disconnect` | *(none)* |
-| `valve_to_port` | `port` (1–16) |
+| `valve_to_port` | `port` (1…N for the valve’s configured `max_ports`) |
 | `valve_to_pump` | `pump` — resolved via `pump_port_map` at runtime |
 | `valve_to_label` | `label` — resolved via `port_labels` at runtime (case-insensitive, trimmed) |
+| `disconnect_everything` | *(none)* — tear down pumps, vacuum, and valve serial |
 
 ## Arduino Vacuum Sketch
 
@@ -367,7 +412,8 @@ pump_control_gui.py              Main GUI application
 sv07_driver.py                   RUNZE SV-07 protocol driver
 pump_environment_check.py        Quick hardware/environment readiness check
 arduino/VacuumPumpV1/            Arduino vacuum sketch (VacuumPumpV1.ino)
-recipes.example.json             Reference example of the JSON format
+README.md                        This file — setup, recipe steps, hardware notes
+recipes.example.json             Reference example (legacy + sequence steps incl. valve)
 recipes.json                     Saved recipes
 pump_labels.json                 Pump nicknames + saved pump count
 push_recipes.ps1                 Commit + push recipes.json and pump_labels.json only
