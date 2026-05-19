@@ -331,6 +331,151 @@
           "seconds": 1.0
         }
       ]
+    },
+    {
+      "id": "95574ab0-5729-4dd9-8bd0-afa57cd3541a",
+      "name": "Full Automation",
+      "num_pumps": 2,
+      "pumps": {
+        "1": {
+          "syringe": "BD 10 mL (10 cc)",
+          "custom_diameter_mm": "14.50",
+          "rate_units": "mL/min",
+          "rate_value": "0.1",
+          "dispense_mode": "Continuous",
+          "volume_ul": "0",
+          "direction": "Infuse"
+        },
+        "2": {
+          "syringe": "BD 10 mL (10 cc)",
+          "custom_diameter_mm": "14.50",
+          "rate_units": "mL/min",
+          "rate_value": "0.1",
+          "dispense_mode": "Continuous",
+          "volume_ul": "0",
+          "direction": "Infuse"
+        }
+      },
+      "pump_conns": {
+        "1": {
+          "com": "COM3",
+          "baud": 19200,
+          "address": 0
+        },
+        "2": {
+          "com": "COM3",
+          "baud": 19200,
+          "address": 0
+        }
+      },
+      "pump_labels": {
+        "1": "Red",
+        "2": "Blue"
+      },
+      "valve_conn": {
+        "com": "COM3",
+        "baud": 9600,
+        "address": 0,
+        "max_ports": 6
+      },
+      "steps": [
+        {
+          "type": "connect_pump",
+          "pump": 1,
+          "com": "COM`17",
+          "baud": 19200,
+          "address": 0
+        },
+        {
+          "type": "connect_pump",
+          "pump": 1,
+          "com": "COM18",
+          "baud": 19200,
+          "address": 0
+        },
+        {
+          "type": "vacuum_connect",
+          "com": "COM6",
+          "baud": 9600
+        },
+        {
+          "type": "valve_connect",
+          "com": "COM9",
+          "baud": 9600,
+          "address": 0,
+          "max_ports": 6
+        },
+        {
+          "type": "valve_to_port",
+          "port": 5
+        },
+        {
+          "type": "vacuum_on"
+        },
+        {
+          "type": "delay",
+          "seconds": 30.0
+        },
+        {
+          "type": "vacuum_off"
+        },
+        {
+          "type": "delay",
+          "seconds": 1.0
+        },
+        {
+          "type": "valve_to_port",
+          "port": 6
+        },
+        {
+          "type": "delay",
+          "seconds": 10.0
+        },
+        {
+          "type": "valve_to_port",
+          "port": 1
+        },
+        {
+          "type": "delay",
+          "seconds": 1.0
+        },
+        {
+          "type": "apply_pump",
+          "pump": 1,
+          "settings": {
+            "syringe": "BD 10 mL (10 cc)",
+            "custom_diameter_mm": "14.50",
+            "rate_units": "mL/min",
+            "rate_value": "1",
+            "dispense_mode": "Continuous",
+            "volume_ul": "0",
+            "direction": "Infuse"
+          }
+        },
+        {
+          "type": "delay",
+          "seconds": 20.0
+        },
+        {
+          "type": "stop_pump",
+          "pump": 1
+        },
+        {
+          "type": "delay",
+          "seconds": 1.0
+        },
+        {
+          "type": "valve_to_port",
+          "port": 4
+        },
+        {
+          "type": "delay",
+          "seconds": 30.0
+        },
+        {
+          "type": "disconnect_everything"
+        }
+      ]
     }
   ]
 }
