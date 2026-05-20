@@ -1617,8 +1617,6 @@ class VacuumPanel(ttk.LabelFrame):
         self._vacuum_blink_phase = False
         self._reader_thread: Optional[threading.Thread] = None
         self._reader_stop = threading.Event()
-        self.latest_kpa: Optional[float] = None
-        self.latest_inhg: Optional[float] = None
         self.latest_bar: Optional[float] = None
         self._build(ports)
 
@@ -1675,16 +1673,6 @@ class VacuumPanel(ttk.LabelFrame):
         self.bar_var = tk.StringVar(value="Vacuum: --- bar")
         ttk.Label(self, textvariable=self.bar_var, font=("Segoe UI", 12, "bold")).grid(
             row=8, column=0, columnspan=2, sticky="w", pady=(8, 0)
-        )
-
-        self.kpa_var = tk.StringVar(value="Vacuum: --- kPa")
-        ttk.Label(self, textvariable=self.kpa_var, font=("Segoe UI", 11, "bold")).grid(
-            row=9, column=0, columnspan=2, sticky="w", pady=(2, 0)
-        )
-
-        self.inhg_var = tk.StringVar(value="Vacuum: --- inHg")
-        ttk.Label(self, textvariable=self.inhg_var, font=("Segoe UI", 11, "bold")).grid(
-            row=10, column=0, columnspan=2, sticky="w", pady=(2, 0)
         )
 
         self.columnconfigure(1, weight=1)
@@ -1745,38 +1733,25 @@ class VacuumPanel(ttk.LabelFrame):
     def _set_reply(self, text: str) -> None:
         self.reply_var.set(f"Arduino reply: {text}")
 
-    def _set_vacuum_readout(self, kpa: Optional[float], inhg: Optional[float]) -> None:
+    def _set_vacuum_readout(self, kpa: Optional[float]) -> None:
         bar = -kpa / 100.0 if kpa is not None else None
-        self.latest_kpa = kpa
-        self.latest_inhg = inhg
         self.latest_bar = bar
         self.bar_var.set(
             f"Vacuum: {bar:+.2f} bar" if bar is not None else "Vacuum: --- bar"
         )
-        self.kpa_var.set(
-            f"Vacuum: {kpa:.2f} kPa" if kpa is not None else "Vacuum: --- kPa"
-        )
-        self.inhg_var.set(
-            f"Vacuum: {inhg:.2f} inHg" if inhg is not None else "Vacuum: --- inHg"
-        )
-
-    def _handle_serial_line(self, line: str) -> None:
-        """Dispatch a single decoded line from the Arduino on the Tk main thread."""
-        if not line:
-            return
-        match = _VACUUM_LINE_RE.search(line)
-        if match:
-            try:
-                kpa = float(match.group(1))
-                inhg = float(match.group(2))
-            except ValueError:
-                return
-            self._set_vacuum_readout(kpa, inhg)
-            return
-        self._set_reply(line)
 
     def _reader_loop(self, conn: serial.Serial) -> None:
-        """Continuously read newline-terminated lines from ``conn`` until stopped."""
+        """Continuously read newline-terminated lines from ``conn`` until stopped.
+
+        Telemetry parsing happens in this background thread so the Tk main
+        thread never sees raw lines. The freshest reading is cached on the
+        panel (atomic attribute writes), and UI redraws are throttled to
+        ~5 Hz — otherwise a 10 Hz Arduino stream floods the after() queue
+        and clicks/animations start lagging. Reply lines (MOTOR:ON/OFF,
+        etc.) are rare and always dispatched immediately.
+        """
+        last_ui_push_ms = 0
+        ui_min_interval_ms = 200  # cap UI updates at ~5 Hz
         while not self._reader_stop.is_set():
             try:
                 if not conn.is_open:
@@ -1784,7 +1759,7 @@ class VacuumPanel(ttk.LabelFrame):
                 raw = conn.readline()
             except (serial.SerialException, OSError):
                 self.after(0, lambda: self._set_reply("(disconnected)"))
-                self.after(0, lambda: self._set_vacuum_readout(None, None))
+                self.after(0, lambda: self._set_vacuum_readout(None))
                 break
             except Exception:
                 break
@@ -1798,7 +1773,20 @@ class VacuumPanel(ttk.LabelFrame):
                 continue
             if not line:
                 continue
-            self.after(0, lambda l=line: self._handle_serial_line(l))
+            match = _VACUUM_LINE_RE.search(line)
+            if match:
+                try:
+                    kpa = float(match.group(1))
+                    inhg = float(match.group(2))
+                except ValueError:
+                    continue
+                self.latest_bar = -kpa / 100.0
+                now_ms = int(time.monotonic() * 1000)
+                if now_ms - last_ui_push_ms >= ui_min_interval_ms:
+                    last_ui_push_ms = now_ms
+                    self.after(0, lambda k=kpa: self._set_vacuum_readout(k))
+            else:
+                self.after(0, lambda l=line: self._set_reply(l))
 
     def _start_reader_thread(self, conn: serial.Serial) -> None:
         existing = self._reader_thread
@@ -1851,7 +1839,7 @@ class VacuumPanel(ttk.LabelFrame):
         self.connected_com = com_name
         self.connected_since_ts = time.time()
         self._set_conn_status(f"Arduino: Connected on {com_name} @ {baud}")
-        self.after(0, lambda: self._set_vacuum_readout(0.0, 0.0))
+        self.after(0, lambda: self._set_vacuum_readout(0.0))
         self._start_reader_thread(self.serial_conn)
         return self.serial_conn
 
@@ -1866,7 +1854,7 @@ class VacuumPanel(ttk.LabelFrame):
         self.connected_com = None
         self.connected_since_ts = None
         self._set_conn_status("Arduino: Disconnected")
-        self.after(0, lambda: self._set_vacuum_readout(None, None))
+        self.after(0, lambda: self._set_vacuum_readout(None))
 
     def open_serial_explicit(self, com: str, baud: int = 9600) -> None:
         """Open vacuum serial on ``com`` (for recipe runner; does not require com_var yet)."""
@@ -1879,7 +1867,7 @@ class VacuumPanel(ttk.LabelFrame):
         self.after(0, lambda c=com: self.com_var.set(c))
         self.after(0, lambda b=baud: self.baud_var.set(str(b)))
         self.after(0, lambda c=com, b=baud: self._set_conn_status(f"Arduino: Connected on {c} @ {b}"))
-        self.after(0, lambda: self._set_vacuum_readout(0.0, 0.0))
+        self.after(0, lambda: self._set_vacuum_readout(0.0))
 
     def close_serial_sync(self) -> None:
         with self._serial_lock:
@@ -4064,8 +4052,6 @@ class OverviewTab(ttk.Frame):
         self.app = app
         self._pump_cards: list[dict[str, Any]] = []
         self._vac_bar_var = tk.StringVar(value="Vacuum: --- bar")
-        self._vac_kpa_var = tk.StringVar(value="--- kPa")
-        self._vac_inhg_var = tk.StringVar(value="--- inHg")
         self._vac_status_var = tk.StringVar(value="Disconnected")
         self._vac_toggle_btn: Optional[tk.Button] = None
         self._valve_pos_var = tk.StringVar(value="Current: —")
@@ -4096,11 +4082,7 @@ class OverviewTab(ttk.Frame):
         # Vacuum card
         vac_card = ttk.LabelFrame(bottom, text="Vacuum / Pressure", padding=10)
         vac_card.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
-        ttk.Label(vac_card, textvariable=self._vac_bar_var, font=("Segoe UI", 18, "bold")).pack(anchor="w")
-        sub_fr = ttk.Frame(vac_card)
-        sub_fr.pack(fill="x", pady=(4, 8))
-        ttk.Label(sub_fr, textvariable=self._vac_kpa_var, font=("Segoe UI", 11)).pack(side="left", padx=(0, 14))
-        ttk.Label(sub_fr, textvariable=self._vac_inhg_var, font=("Segoe UI", 11)).pack(side="left")
+        ttk.Label(vac_card, textvariable=self._vac_bar_var, font=("Segoe UI", 18, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Label(vac_card, textvariable=self._vac_status_var, foreground="#888").pack(anchor="w", pady=(0, 8))
         btn_fr = ttk.Frame(vac_card)
         btn_fr.pack(fill="x")
@@ -4252,8 +4234,6 @@ class OverviewTab(ttk.Frame):
         vp = self.app.vacuum_panel
         if vp is not None:
             self._vac_bar_var.set(vp.bar_var.get() if hasattr(vp, "bar_var") else "Vacuum: --- bar")
-            self._vac_kpa_var.set(vp.kpa_var.get() if hasattr(vp, "kpa_var") else "--- kPa")
-            self._vac_inhg_var.set(vp.inhg_var.get() if hasattr(vp, "inhg_var") else "--- inHg")
             self._vac_status_var.set(vp.status_var.get() if hasattr(vp, "status_var") else "—")
             if self._vac_toggle_btn is not None:
                 if getattr(vp, "is_on", False):

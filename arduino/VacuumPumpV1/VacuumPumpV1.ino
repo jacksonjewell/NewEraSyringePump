@@ -107,5 +107,5 @@ void loop() {
 
   // Small delay prevents CPU saturation
   // and stabilizes serial comms
-  delay(10);
+  delay(50);
 }
