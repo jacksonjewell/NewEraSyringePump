@@ -1630,9 +1630,13 @@ class VacuumPanel(ttk.LabelFrame):
 
         ttk.Label(self, text="Baud").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.baud_var = tk.StringVar(value="9600")
-        ttk.Entry(self, textvariable=self.baud_var, width=12, state="readonly").grid(
-            row=1, column=1, sticky="w", padx=(6, 0), pady=(6, 0)
-        )
+        ttk.Combobox(
+            self,
+            textvariable=self.baud_var,
+            values=VACUUM_BAUD_RATES,
+            state="readonly",
+            width=10,
+        ).grid(row=1, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
 
         ttk.Label(self, text="Startup Delay (s)").grid(row=2, column=0, sticky="w", pady=(6, 0))
         self.startup_delay_var = tk.StringVar(value="2.0")
@@ -1837,11 +1841,16 @@ class VacuumPanel(ttk.LabelFrame):
         if not com_name:
             raise ValueError("Select or type a COM port for the vacuum Arduino.")
 
+        try:
+            baud = int(self.baud_var.get().strip())
+        except (TypeError, ValueError):
+            baud = 9600
+
         self._close_serial()
-        self.serial_conn = serial.Serial(port=com_name, baudrate=9600, timeout=1)
+        self.serial_conn = serial.Serial(port=com_name, baudrate=baud, timeout=1)
         self.connected_com = com_name
         self.connected_since_ts = time.time()
-        self._set_conn_status(f"Arduino: Connected on {com_name} @ 9600")
+        self._set_conn_status(f"Arduino: Connected on {com_name} @ {baud}")
         self.after(0, lambda: self._set_vacuum_readout(0.0, 0.0))
         self._start_reader_thread(self.serial_conn)
         return self.serial_conn
@@ -1868,7 +1877,8 @@ class VacuumPanel(ttk.LabelFrame):
             self.connected_since_ts = time.time()
             self._start_reader_thread(self.serial_conn)
         self.after(0, lambda c=com: self.com_var.set(c))
-        self.after(0, lambda c=com: self._set_conn_status(f"Arduino: Connected on {c} @ {baud}"))
+        self.after(0, lambda b=baud: self.baud_var.set(str(b)))
+        self.after(0, lambda c=com, b=baud: self._set_conn_status(f"Arduino: Connected on {c} @ {b}"))
         self.after(0, lambda: self._set_vacuum_readout(0.0, 0.0))
 
     def close_serial_sync(self) -> None:

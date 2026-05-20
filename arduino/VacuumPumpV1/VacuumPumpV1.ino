@@ -1,7 +1,8 @@
 /*
  * VacuumPumpV1 — Arduino Uno vacuum motor + MPX5100DP pressure stream
  *
- * Serial @ 9600 baud. Matches the Python GUI vacuum panel.
+ * Serial @ 115200 baud. The Python GUI's vacuum panel must have its Baud
+ * dropdown set to 115200 to match (defaults to 9600 in the UI).
  *
  * Commands from GUI:
  *   '1'  -> motor + LED ON,  replies "MOTOR:ON"
@@ -14,6 +15,8 @@
  *   motor relay/transistor signal -> D9
  *   indicator LED (with ~220 ohm resistor) -> D3
  *   MPX5100DP analog output       -> A0
+ *   MPX5100DP P2 (back/vent port) -> vacuum line
+ *   MPX5100DP P1 (front port)     -> open to atmosphere
  */
 
 const int motorPin = 9;
@@ -40,45 +43,58 @@ void setup() {
   digitalWrite(motorPin, LOW);
   digitalWrite(ledPin, LOW);
 
-  Serial.begin(9600);
+  // Faster serial communication
+  Serial.begin(115200);
 }
 
 void loop() {
-  // Handle GUI commands
-  if (Serial.available() > 0) {
+
+  // -----------------------------
+  // Handle GUI serial commands
+  // -----------------------------
+  while (Serial.available() > 0) {
+
     char cmd = Serial.read();
 
     if (cmd == '1') {
       digitalWrite(motorPin, HIGH);
       digitalWrite(ledPin, HIGH);
       motorState = true;
+
       Serial.println("MOTOR:ON");
     }
+
     else if (cmd == '0') {
       digitalWrite(motorPin, LOW);
       digitalWrite(ledPin, LOW);
       motorState = false;
+
       Serial.println("MOTOR:OFF");
     }
   }
 
-  // Stream vacuum readings continuously (lets the GUI monitor vacuum hold
-  // after the pump shuts off, and reads ~0 kPa when no vacuum is applied).
+  // -----------------------------
+  // Send vacuum telemetry
+  // -----------------------------
   if (millis() - lastPrintTime >= printInterval) {
+
     lastPrintTime = millis();
 
     int rawTotal = 0;
     const int numSamples = 5;
+
     for (int i = 0; i < numSamples; i++) {
       rawTotal += analogRead(sensorPin);
     }
 
     float rawAvg = rawTotal / (float)numSamples;
+
     float voltage = rawAvg * (V_SUPPLY / 1023.0);
 
-    float pressure_kPa = (voltage - V_MIN) * (P_MAX / (V_MAX - V_MIN));
-    if (pressure_kPa < 0) pressure_kPa = 0;
-    if (pressure_kPa > P_MAX) pressure_kPa = P_MAX;
+    float pressure_kPa =
+      (voltage - V_MIN) * (P_MAX / (V_MAX - V_MIN));
+
+    pressure_kPa = constrain(pressure_kPa, 0, P_MAX);
 
     float vacuum_kPa = pressure_kPa;
     float vacuum_inHg = vacuum_kPa * KPA_TO_INHG;
@@ -88,4 +104,8 @@ void loop() {
     Serial.print(",INHG:");
     Serial.println(vacuum_inHg, 2);
   }
+
+  // Small delay prevents CPU saturation
+  // and stabilizes serial comms
+  delay(10);
 }
