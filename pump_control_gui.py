@@ -1747,11 +1747,19 @@ class VacuumPanel(ttk.LabelFrame):
         thread never sees raw lines. The freshest reading is cached on the
         panel (atomic attribute writes), and UI redraws are throttled to
         ~5 Hz — otherwise a 10 Hz Arduino stream floods the after() queue
-        and clicks/animations start lagging. Reply lines (MOTOR:ON/OFF,
-        etc.) are rare and always dispatched immediately.
+        and clicks/animations start lagging.
+
+        Non-telemetry lines are also filtered: only recognized status
+        replies (MOTOR:ON / MOTOR:OFF) are forwarded to the UI, and even
+        those are rate-limited. Any other line (e.g., a VACUUM_KPA line
+        garbled mid-flight by motor EMI) is silently dropped. Without
+        this, a noisy serial link can flood Tk's after() queue with
+        bogus "Arduino reply" updates and freeze the GUI.
         """
         last_ui_push_ms = 0
+        last_reply_push_ms = 0
         ui_min_interval_ms = 200  # cap UI updates at ~5 Hz
+        max_line_len = 128
         while not self._reader_stop.is_set():
             try:
                 if not conn.is_open:
@@ -1771,13 +1779,12 @@ class VacuumPanel(ttk.LabelFrame):
                 line = raw.decode("utf-8", errors="ignore").strip()
             except Exception:
                 continue
-            if not line:
+            if not line or len(line) > max_line_len:
                 continue
             match = _VACUUM_LINE_RE.search(line)
             if match:
                 try:
                     kpa = float(match.group(1))
-                    inhg = float(match.group(2))
                 except ValueError:
                     continue
                 self.latest_bar = -kpa / 100.0
@@ -1785,8 +1792,11 @@ class VacuumPanel(ttk.LabelFrame):
                 if now_ms - last_ui_push_ms >= ui_min_interval_ms:
                     last_ui_push_ms = now_ms
                     self.after(0, lambda k=kpa: self._set_vacuum_readout(k))
-            else:
-                self.after(0, lambda l=line: self._set_reply(l))
+            elif line.startswith("MOTOR:"):
+                now_ms = int(time.monotonic() * 1000)
+                if now_ms - last_reply_push_ms >= ui_min_interval_ms:
+                    last_reply_push_ms = now_ms
+                    self.after(0, lambda l=line: self._set_reply(l))
 
     def _start_reader_thread(self, conn: serial.Serial) -> None:
         existing = self._reader_thread
