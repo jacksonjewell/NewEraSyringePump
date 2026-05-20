@@ -8,8 +8,14 @@
  *   '1'  -> motor + LED ON,  replies "MOTOR:ON"
  *   '0'  -> motor + LED OFF, replies "MOTOR:OFF"
  *
- * Continuous telemetry (10 Hz, always while connected — independent of motor state):
+ * Continuous telemetry (2 Hz, always while connected — independent of motor state):
  *   VACUUM_KPA:<kpa>,INHG:<inhg>
+ *
+ * The 2 Hz rate is intentional: vacuum levels change slowly, so a low
+ * stream rate is plenty for the user. More importantly, less serial
+ * traffic per second means fewer chances for brushed-motor EMI to
+ * corrupt bytes (in either direction), which makes Tap OFF commands
+ * far more reliable while the motor is running.
  *
  * Wiring:
  *   motor relay/transistor signal -> D9
@@ -34,7 +40,7 @@ const float KPA_TO_INHG = 0.2953;
 bool motorState = false;
 
 unsigned long lastPrintTime = 0;
-const unsigned long printInterval = 100; // ms (10 Hz)
+const unsigned long printInterval = 500; // ms (2 Hz)
 
 void setup() {
   pinMode(motorPin, OUTPUT);

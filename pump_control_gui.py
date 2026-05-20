@@ -1753,8 +1753,9 @@ class VacuumPanel(ttk.LabelFrame):
         Telemetry parsing happens in this background thread so the Tk main
         thread never sees raw lines. The freshest reading is cached on the
         panel (atomic attribute writes), and UI redraws are throttled to
-        ~5 Hz — otherwise a 10 Hz Arduino stream floods the after() queue
-        and clicks/animations start lagging.
+        ~5 Hz. The Arduino currently streams at 2 Hz so the throttle is
+        effectively a no-op at the moment, but it stays in place as a
+        safety net in case the sketch is flashed with a higher rate.
 
         Non-telemetry lines are also filtered: only recognized status
         replies (MOTOR:ON / MOTOR:OFF) are forwarded to the UI, and even
