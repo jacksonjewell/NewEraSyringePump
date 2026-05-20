@@ -1602,6 +1602,13 @@ _VACUUM_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Brushed-motor EMI can flip bits on the USB-serial line, occasionally
+# garbling a single '0' / '1' command byte from the GUI -> Arduino. Sending
+# the command as a short burst makes it robust: the Arduino handles each
+# byte idempotently (setting motor ON / OFF), and EMI would have to corrupt
+# every copy in the burst (~430 us at 115200 baud for 5 bytes) to defeat it.
+_VACUUM_CMD_REPEATS = 5
+
 
 class VacuumPanel(ttk.LabelFrame):
     """Vacuum control using an Arduino serial command (1/0)."""
@@ -1769,7 +1776,9 @@ class VacuumPanel(ttk.LabelFrame):
                 self.after(0, lambda: self._set_reply("(disconnected)"))
                 self.after(0, lambda: self._set_vacuum_readout(None))
                 break
-            except Exception:
+            except Exception as exc:
+                msg = repr(exc)[:80]
+                self.after(0, lambda m=msg: self._set_reply(f"(reader stopped: {m})"))
                 break
             if self._reader_stop.is_set():
                 break
@@ -1845,7 +1854,9 @@ class VacuumPanel(ttk.LabelFrame):
             baud = 9600
 
         self._close_serial()
-        self.serial_conn = serial.Serial(port=com_name, baudrate=baud, timeout=1)
+        self.serial_conn = serial.Serial(
+            port=com_name, baudrate=baud, timeout=1, write_timeout=2
+        )
         self.connected_com = com_name
         self.connected_since_ts = time.time()
         self._set_conn_status(f"Arduino: Connected on {com_name} @ {baud}")
@@ -1870,7 +1881,9 @@ class VacuumPanel(ttk.LabelFrame):
         """Open vacuum serial on ``com`` (for recipe runner; does not require com_var yet)."""
         with self._serial_lock:
             self._close_serial()
-            self.serial_conn = serial.Serial(port=com, baudrate=baud, timeout=1)
+            self.serial_conn = serial.Serial(
+                port=com, baudrate=baud, timeout=1, write_timeout=2
+            )
             self.connected_com = com
             self.connected_since_ts = time.time()
             self._start_reader_thread(self.serial_conn)
@@ -1892,7 +1905,8 @@ class VacuumPanel(ttk.LabelFrame):
         with self._serial_lock:
             conn = self._ensure_connected()
             self._wait_until_ready()
-            conn.write(("1" if on else "0").encode("ascii"))
+            value = ("1" if on else "0") * _VACUUM_CMD_REPEATS
+            conn.write(value.encode("ascii"))
             conn.flush()
             self.is_on = on
         self.after(0, lambda o=on: self.toggle_btn.config(text="Tap OFF" if o else "Tap ON"))
@@ -1903,7 +1917,7 @@ class VacuumPanel(ttk.LabelFrame):
         with self._serial_lock:
             conn = self._ensure_connected()
             self._wait_until_ready()
-            conn.write(value.encode("ascii"))
+            conn.write((value * _VACUUM_CMD_REPEATS).encode("ascii"))
             conn.flush()
 
     def connect_arduino(self) -> None:
