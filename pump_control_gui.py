@@ -13,6 +13,7 @@ import threading
 import time
 import tkinter as tk
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox, simpledialog, ttk
@@ -1610,6 +1611,186 @@ _VACUUM_LINE_RE = re.compile(
 _VACUUM_CMD_REPEATS = 5
 
 
+class VacuumPlot(ttk.Frame):
+    """Lightweight scrolling line plot of vacuum (bar) vs. time.
+
+    Pure tk.Canvas implementation so the project doesn't need matplotlib
+    just to draw a single line. The expected sample count is small
+    (a few hundred at most for typical windows), so redrawing from
+    scratch on every tick is cheap.
+
+    A periodic 4 Hz redraw makes the time axis scroll smoothly even when
+    no new samples arrive (e.g. serial is briefly silent), and ensures
+    stale data ages off the left edge cleanly.
+    """
+
+    PADDING = (50, 12, 12, 28)  # left, right, top, bottom in pixels
+    LINE_COLOR = "#3B82F6"
+    PLOT_BG = "#FAFAFA"
+    PLOT_BORDER = "#888"
+    GRID_COLOR = "#E5E5E5"
+    TEXT_COLOR = "#444"
+
+    def __init__(
+        self,
+        master: tk.Widget,
+        *,
+        time_window_s: float = 30.0,
+        y_min: float = -1.0,
+        y_max: float = 0.05,
+        auto_y: bool = False,
+        height: int = 180,
+    ) -> None:
+        super().__init__(master)
+        self.time_window_s = float(time_window_s)
+        self.y_min = float(y_min)
+        self.y_max = float(y_max)
+        self.auto_y = bool(auto_y)
+        self.samples: "deque[tuple[float, float]]" = deque()
+        self.canvas = tk.Canvas(
+            self,
+            height=height,
+            highlightthickness=0,
+            background="SystemButtonFace",
+        )
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda _e: self._redraw())
+        self._redraw_after_id: Optional[Any] = self.after(250, self._tick)
+
+    def add_sample(self, bar: Optional[float]) -> None:
+        if bar is None:
+            return
+        now = time.monotonic()
+        self.samples.append((now, float(bar)))
+        cutoff = now - self.time_window_s - 1.0
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
+
+    def clear(self) -> None:
+        self.samples.clear()
+        self._redraw()
+
+    def set_time_window(self, seconds: float) -> None:
+        self.time_window_s = max(2.0, float(seconds))
+        self._redraw()
+
+    def set_y_range(
+        self, y_min: float, y_max: float, *, auto: bool = False
+    ) -> None:
+        self.auto_y = bool(auto)
+        if not auto:
+            self.y_min = float(y_min)
+            self.y_max = float(y_max)
+        self._redraw()
+
+    def _tick(self) -> None:
+        self._redraw()
+        self._redraw_after_id = self.after(250, self._tick)
+
+    def _redraw(self) -> None:
+        c = self.canvas
+        c.delete("all")
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 60 or h < 60:
+            return
+
+        ml, mr, mt, mb = self.PADDING
+        plot_w = w - ml - mr
+        plot_h = h - mt - mb
+        if plot_w < 30 or plot_h < 30:
+            return
+
+        now = time.monotonic()
+        t_left = now - self.time_window_s
+
+        if self.auto_y and self.samples:
+            vals = [s[1] for s in self.samples if s[0] >= t_left]
+            if vals:
+                y_min, y_max = min(vals), max(vals)
+                if (y_max - y_min) < 0.05:
+                    mid = (y_max + y_min) / 2.0
+                    y_min, y_max = mid - 0.05, mid + 0.05
+            else:
+                y_min, y_max = self.y_min, self.y_max
+        else:
+            y_min, y_max = self.y_min, self.y_max
+        if y_max <= y_min:
+            y_max = y_min + 1.0
+
+        c.create_rectangle(
+            ml, mt, ml + plot_w, mt + plot_h,
+            outline=self.PLOT_BORDER, width=1, fill=self.PLOT_BG,
+        )
+
+        n_y = 5
+        for i in range(n_y):
+            frac = i / (n_y - 1)
+            y_val = y_min + frac * (y_max - y_min)
+            y_pix = mt + plot_h - frac * plot_h
+            c.create_line(ml, y_pix, ml + plot_w, y_pix, fill=self.GRID_COLOR)
+            c.create_text(
+                ml - 4, y_pix, anchor="e",
+                text=f"{y_val:+.2f}",
+                font=("Segoe UI", 8),
+                fill=self.TEXT_COLOR,
+            )
+
+        n_x = 5
+        for i in range(n_x):
+            frac = i / (n_x - 1)
+            t_val = -self.time_window_s + frac * self.time_window_s
+            x_pix = ml + frac * plot_w
+            c.create_line(x_pix, mt, x_pix, mt + plot_h, fill=self.GRID_COLOR)
+            c.create_text(
+                x_pix, mt + plot_h + 12, anchor="center",
+                text=f"{t_val:+.0f}s",
+                font=("Segoe UI", 8),
+                fill=self.TEXT_COLOR,
+            )
+
+        c.create_text(
+            ml - 4, mt - 4, anchor="se",
+            text="bar",
+            font=("Segoe UI", 8, "bold"),
+            fill=self.TEXT_COLOR,
+        )
+
+        if len(self.samples) >= 2:
+            pts: list[tuple[float, float]] = []
+            for t, v in self.samples:
+                if t < t_left:
+                    continue
+                x_frac = (t - t_left) / self.time_window_s
+                y_frac = (v - y_min) / (y_max - y_min)
+                if y_frac < 0:
+                    y_frac = 0.0
+                elif y_frac > 1:
+                    y_frac = 1.0
+                x = ml + x_frac * plot_w
+                y = mt + plot_h - y_frac * plot_h
+                pts.append((x, y))
+            if len(pts) >= 2:
+                flat: list[float] = [coord for pt in pts for coord in pt]
+                c.create_line(
+                    *flat, fill=self.LINE_COLOR, width=2, smooth=False,
+                )
+                lx, ly = pts[-1]
+                c.create_oval(
+                    lx - 3, ly - 3, lx + 3, ly + 3,
+                    fill=self.LINE_COLOR, outline="",
+                )
+
+    def destroy(self) -> None:  # type: ignore[override]
+        if self._redraw_after_id is not None:
+            try:
+                self.after_cancel(self._redraw_after_id)
+            except Exception:
+                pass
+            self._redraw_after_id = None
+        super().destroy()
+
+
 class VacuumPanel(ttk.LabelFrame):
     """Vacuum control using an Arduino serial command (1/0)."""
 
@@ -1625,6 +1806,7 @@ class VacuumPanel(ttk.LabelFrame):
         self._reader_thread: Optional[threading.Thread] = None
         self._reader_stop = threading.Event()
         self.latest_bar: Optional[float] = None
+        self.vacuum_plot: Optional[VacuumPlot] = None
         self._build(ports)
 
     def _build(self, ports: list[str]) -> None:
@@ -1682,7 +1864,21 @@ class VacuumPanel(ttk.LabelFrame):
             row=8, column=0, columnspan=2, sticky="w", pady=(8, 0)
         )
 
+        plot_hdr = ttk.Frame(self)
+        plot_hdr.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(8, 2))
+        plot_hdr.columnconfigure(0, weight=1)
+        ttk.Label(plot_hdr, text="Bar vs. time").grid(row=0, column=0, sticky="w")
+        ttk.Button(
+            plot_hdr, text="Plot range…", command=self._open_plot_range_dialog,
+        ).grid(row=0, column=1, sticky="e")
+
+        self.vacuum_plot = VacuumPlot(self)
+        self.vacuum_plot.grid(
+            row=10, column=0, columnspan=2, sticky="nsew", pady=(0, 0)
+        )
+
         self.columnconfigure(1, weight=1)
+        self.rowconfigure(10, weight=1)
 
     def update_port_choices(self, ports: list[str]) -> None:
         current = self.com_var.get().strip()
@@ -1746,6 +1942,96 @@ class VacuumPanel(ttk.LabelFrame):
         self.bar_var.set(
             f"Vacuum: {bar:+.2f} bar" if bar is not None else "Vacuum: --- bar"
         )
+        if self.vacuum_plot is not None:
+            if bar is None:
+                self.vacuum_plot.clear()
+            else:
+                self.vacuum_plot.add_sample(bar)
+
+    def _open_plot_range_dialog(self) -> None:
+        plot = self.vacuum_plot
+        if plot is None:
+            return
+
+        d = tk.Toplevel(self)
+        d.title("Vacuum plot range")
+        d.transient(self.winfo_toplevel())
+        d.resizable(False, False)
+        fr = ttk.Frame(d, padding=12)
+        fr.pack(fill="both", expand=True)
+
+        ttk.Label(fr, text="Time window (s)").grid(row=0, column=0, sticky="w")
+        tw_var = tk.StringVar(value=str(int(plot.time_window_s)))
+        ttk.Combobox(
+            fr, textvariable=tw_var,
+            values=["10", "30", "60", "120", "300"],
+            width=8,
+        ).grid(row=0, column=1, sticky="w", padx=8)
+
+        auto_var = tk.BooleanVar(value=plot.auto_y)
+        ttk.Checkbutton(
+            fr, text="Auto-scale Y axis", variable=auto_var,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+
+        ttk.Label(fr, text="Y min (bar)").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ymin_var = tk.StringVar(value=f"{plot.y_min:.2f}")
+        ymin_entry = ttk.Entry(fr, textvariable=ymin_var, width=10)
+        ymin_entry.grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        ttk.Label(fr, text="Y max (bar)").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ymax_var = tk.StringVar(value=f"{plot.y_max:.2f}")
+        ymax_entry = ttk.Entry(fr, textvariable=ymax_var, width=10)
+        ymax_entry.grid(row=3, column=1, sticky="w", padx=8, pady=(8, 0))
+
+        def update_y_state(*_args: Any) -> None:
+            st = "disabled" if auto_var.get() else "normal"
+            ymin_entry.configure(state=st)
+            ymax_entry.configure(state=st)
+
+        auto_var.trace_add("write", update_y_state)
+        update_y_state()
+
+        def ok() -> None:
+            try:
+                tw = float(tw_var.get().strip())
+                if tw < 2 or tw > 3600:
+                    raise ValueError("out of range")
+            except ValueError:
+                messagebox.showerror(
+                    "Plot range",
+                    "Time window must be between 2 and 3600 seconds.",
+                    parent=d,
+                )
+                return
+            auto = bool(auto_var.get())
+            if auto:
+                ymin, ymax = plot.y_min, plot.y_max
+            else:
+                try:
+                    ymin = float(ymin_var.get().strip())
+                    ymax = float(ymax_var.get().strip())
+                except ValueError:
+                    messagebox.showerror(
+                        "Plot range",
+                        "Y min and Y max must be numeric.",
+                        parent=d,
+                    )
+                    return
+                if ymax <= ymin:
+                    messagebox.showerror(
+                        "Plot range",
+                        "Y max must be greater than Y min.",
+                        parent=d,
+                    )
+                    return
+            plot.set_time_window(tw)
+            plot.set_y_range(ymin, ymax, auto=auto)
+            d.destroy()
+
+        btn_fr = ttk.Frame(fr)
+        btn_fr.grid(row=4, column=0, columnspan=2, sticky="e", pady=(16, 0))
+        ttk.Button(btn_fr, text="Cancel", command=d.destroy).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_fr, text="Apply", command=ok).pack(side="left")
 
     def _reader_loop(self, conn: serial.Serial) -> None:
         """Continuously read newline-terminated lines from ``conn`` until stopped.
