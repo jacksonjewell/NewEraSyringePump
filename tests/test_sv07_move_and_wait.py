@@ -68,6 +68,13 @@ def _install_serial_stub() -> None:
     serial_mod.Serial = _Serial
     serial_mod.SerialException = _SerialException
     sys.modules["serial"] = serial_mod
+    tools_mod = types.ModuleType("serial.tools")
+    list_ports_mod = types.ModuleType("serial.tools.list_ports")
+    list_ports_mod.comports = lambda: []
+    tools_mod.list_ports = list_ports_mod
+    serial_mod.tools = tools_mod
+    sys.modules["serial.tools"] = tools_mod
+    sys.modules["serial.tools.list_ports"] = list_ports_mod
 
 
 _install_serial_stub()
