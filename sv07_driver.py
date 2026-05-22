@@ -207,6 +207,12 @@ class SV07:
         Move to *port* and poll status until idle or *timeout_s*. If *abort* is supplied
         and is set (anything that has ``is_set()``), this returns -1 immediately without
         further polling. Returns the final reported position on success.
+
+        Raises :class:`SV07Error` if the firmware reports an error status code (B2 is
+        anything other than IDLE/BUSY) or if the rotor's reported position does not
+        match the requested *port* after the motor reports idle. Treating either of
+        those silently as success would let downstream recipe steps dispense fluid
+        through the wrong valve port — a serious cross-contamination / safety risk.
         """
         self.move(port)
         deadline = time.monotonic() + timeout_s
@@ -214,11 +220,33 @@ class SV07:
         while time.monotonic() < deadline:
             if abort is not None and getattr(abort, "is_set", lambda: False)():
                 return -1
-            text, busy = self.get_status()
+            resp = self._exchange(build_frame(self.address, FUNC_QUERY_STATUS))
+            b2 = resp[2]
+            text, busy = status_text(b2)
             last_status = text
-            if not busy:
-                return self.get_position()
-            time.sleep(poll_interval_s)
+            if busy:
+                time.sleep(poll_interval_s)
+                continue
+            if b2 != STATUS_IDLE:
+                # Any non-idle, non-busy status byte is a documented firmware error
+                # (motor fault, mechanical jam, encoder mismatch, …). The rotor has
+                # NOT reached the requested port, so we must not let the caller
+                # treat the reported position as a successful move.
+                raise SV07Error(
+                    f"valve reported error status 0x{b2:02X} ({text}) after move "
+                    f"to port {port}; aborting to avoid wrong-port dispense"
+                )
+            final = self.get_position()
+            if final != port:
+                # Firmware reports idle but the rotor is at a different port from
+                # the one we requested (e.g. motor stall before completion).
+                # Refuse to claim success; recipe runner will surface this as an
+                # error and stop before any pump step uses the wrong line.
+                raise SV07Error(
+                    f"valve idle at port {final} after requesting port {port}; "
+                    f"move did not reach the target — aborting to avoid wrong-port dispense"
+                )
+            return final
         raise SV07Error(
             f"valve move did not complete within {timeout_s:.1f}s; last status: {last_status}"
         )

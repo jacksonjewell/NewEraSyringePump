@@ -1435,13 +1435,34 @@ class PumpPanel(ttk.LabelFrame):
         self._run_in_thread(work)
 
     def snapshot_settings(self) -> dict:
+        # The on-disk schema's "volume_ul" key is documented to be in true
+        # microliters, but the entry's unit picker can be set to "uL", "mL",
+        # or "L". Without converting here, a value typed under "mL" or "L"
+        # would be stored verbatim and later interpreted as µL — a silent
+        # 1000×/1,000,000× overdose on the next recipe run.
+        raw_text = self.volume_ul_var.get().strip()
+        unit = self._vol_disp_unit_var.get().strip() if hasattr(self, "_vol_disp_unit_var") else "uL"
+        if unit == "uL" or unit == "":
+            stored = raw_text or "0"
+        else:
+            try:
+                raw = float(raw_text) if raw_text else 0.0
+            except ValueError:
+                raw = 0.0
+            if unit == "mL":
+                volume_ul = raw * 1000.0
+            elif unit == "L":
+                volume_ul = raw * 1_000_000.0
+            else:
+                volume_ul = raw
+            stored = ("%g" % volume_ul) if volume_ul else "0"
         return {
             "syringe": self.syringe_var.get(),
             "custom_diameter_mm": self.custom_diameter_var.get().strip(),
             "rate_units": self.rate_units_var.get(),
             "rate_value": self.rate_var.get().strip(),
             "dispense_mode": self.dispense_mode_var.get(),
-            "volume_ul": self.volume_ul_var.get().strip(),
+            "volume_ul": stored,
             "direction": self.direction_var.get(),
         }
 
@@ -1453,6 +1474,12 @@ class PumpPanel(ttk.LabelFrame):
         self.rate_units_var.set(data["rate_units"])
         self.rate_var.set(data["rate_value"])
         self.dispense_mode_var.set(data["dispense_mode"])
+        # Snapshots/recipes always store volume in microliters. Force the
+        # entry's unit picker to "uL" so apply_settings_sync interprets the
+        # value as µL — otherwise a recipe loaded while the user has the
+        # picker on "mL" or "L" would silently dispense 1000×/1,000,000×.
+        if hasattr(self, "_vol_disp_unit_var"):
+            self._vol_disp_unit_var.set("uL")
         self.volume_ul_var.set(data["volume_ul"])
         self.direction_var.set(data["direction"])
 
@@ -5977,11 +6004,23 @@ class PumpControllerApp(tk.Tk):
     def _run_group_action(self, source_panel: PumpPanel, action_name: str) -> None:
         targets = self._targets_for_action(source_panel)
         snapshot = source_panel.snapshot_settings()
+        app = self
 
         def work() -> None:
             for panel in targets:
                 if panel is not source_panel:
-                    panel.after(0, lambda p=panel: p.apply_settings_from_snapshot(snapshot))
+                    # Block the worker until the GUI thread has actually
+                    # written the source's settings into this target panel.
+                    # A fire-and-forget after(0, …) here would let
+                    # apply_settings_sync below read the target's previous,
+                    # stale rate/volume — programming the target pump with
+                    # the WRONG settings (potentially a 100× overdose on a
+                    # syringe pump). Mirrors the pattern used in
+                    # run_recipe_sequence.
+                    run_on_main_thread(
+                        app,
+                        lambda p=panel, s=snapshot: p.apply_settings_from_snapshot(s),
+                    )
                 if action_name == "apply":
                     panel.apply_settings_sync()
                     panel.after(0, lambda p=panel: p.set_status("Settings applied"))
