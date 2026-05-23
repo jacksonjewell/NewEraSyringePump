@@ -2257,7 +2257,11 @@ class VacuumPanel(ttk.LabelFrame):
                     conn = self.serial_conn
                     if conn is not None and getattr(conn, "is_open", False):
                         try:
-                            conn.write(b"0")
+                            # Burst-send to defeat motor-EMI bit-flips on the
+                            # USB-serial line. This is the safety-critical
+                            # emergency-off path; sending a single byte risks
+                            # leaving the motor running if EMI corrupts it.
+                            conn.write(b"0" * _VACUUM_CMD_REPEATS)
                             conn.flush()
                         except Exception:
                             pass
@@ -5254,7 +5258,11 @@ class PumpControllerApp(tk.Tk):
                     conn = vp.serial_conn
                     if conn is not None and getattr(conn, "is_open", False):
                         try:
-                            conn.write(b"0")
+                            # Burst-send so motor-EMI bit-flips on the
+                            # USB-serial line cannot eat the emergency-stop
+                            # byte and leave the vacuum motor running after
+                            # the user explicitly aborted.
+                            conn.write(b"0" * _VACUUM_CMD_REPEATS)
                             conn.flush()
                         except Exception:
                             pass
