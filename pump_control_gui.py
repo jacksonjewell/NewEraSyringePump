@@ -2257,7 +2257,11 @@ class VacuumPanel(ttk.LabelFrame):
                     conn = self.serial_conn
                     if conn is not None and getattr(conn, "is_open", False):
                         try:
-                            conn.write(b"0")
+                            # Burst the OFF byte so a single EMI-corrupted byte
+                            # cannot leave the motor running while the GUI
+                            # reports it as off. Mirrors _send_value /
+                            # send_vacuum_sync (see _VACUUM_CMD_REPEATS).
+                            conn.write(b"0" * _VACUUM_CMD_REPEATS)
                             conn.flush()
                         except Exception:
                             pass
@@ -5254,7 +5258,11 @@ class PumpControllerApp(tk.Tk):
                     conn = vp.serial_conn
                     if conn is not None and getattr(conn, "is_open", False):
                         try:
-                            conn.write(b"0")
+                            # Same EMI burst as the regular toggle/recipe
+                            # paths. The abort fires precisely when the motor
+                            # is running and most likely to corrupt a single
+                            # OFF byte (see _VACUUM_CMD_REPEATS).
+                            conn.write(b"0" * _VACUUM_CMD_REPEATS)
                             conn.flush()
                         except Exception:
                             pass
