@@ -87,9 +87,9 @@ def verify_response(resp: bytes) -> tuple[bool, str]:
 
 def status_text(byte_b2: int) -> tuple[str, bool]:
     """Return (human text, busy?) for a motor-status (0x4A) reply byte."""
-    if byte_b2 == STATUS_IDLE:
+    if byte_b2 in (STATUS_IDLE, 0x01):
         return "Idle", False
-    if byte_b2 == STATUS_BUSY:
+    if byte_b2 in (STATUS_BUSY, 0x02, 0x03):
         return "Moving", True
     return f"Error 0x{byte_b2:02X}", False
 
@@ -145,20 +145,38 @@ class SV07:
                 pass
             self.ser = None
 
-    def _exchange(self, packet: bytes, response_len: int = 8, settle_s: float = 0.06) -> bytes:
+    def _exchange(
+        self,
+        packet: bytes,
+        response_len: int = 8,
+        settle_s: float = 0.06,
+        retries: int = 3,
+    ) -> bytes:
         if not self.is_open:
             raise SV07Error("serial port is not open")
         assert self.ser is not None
-        self.ser.reset_input_buffer()
-        self.ser.write(packet)
-        self.ser.flush()
-        if settle_s > 0:
-            time.sleep(settle_s)
-        resp = self.ser.read(response_len)
-        ok, msg = verify_response(resp)
-        if not ok:
-            raise SV07Error(f"bad response: {msg}; raw={resp.hex(' ')}")
-        return resp
+        last_err: Optional[SV07Error] = None
+        for attempt in range(max(1, retries)):
+            try:
+                self.ser.reset_input_buffer()
+                self.ser.write(packet)
+                self.ser.flush()
+                if settle_s > 0:
+                    time.sleep(settle_s)
+                resp = self.ser.read(response_len)
+                ok, msg = verify_response(resp)
+                if not ok:
+                    raise SV07Error(f"bad response: {msg}; raw={resp.hex(' ')}")
+                return resp
+            except SV07Error as exc:
+                last_err = exc
+                if attempt + 1 < retries:
+                    time.sleep(0.06 * (attempt + 1))
+                    continue
+                raise
+        if last_err is not None:
+            raise last_err
+        raise SV07Error("exchange failed")
 
     def move(self, port: int) -> None:
         """Send a move-to-port command. Does not wait for completion."""
@@ -194,7 +212,10 @@ class SV07:
             self._pos_func_locked = True
         else:
             self._pos_func_locked = True
-        return resp[3]
+        pos = resp[3]
+        if pos < 1 or pos > self.max_ports:
+            raise SV07Error(f"invalid position byte {pos} (expected 1..{self.max_ports})")
+        return pos
 
     def move_and_wait(
         self,
@@ -211,13 +232,34 @@ class SV07:
         self.move(port)
         deadline = time.monotonic() + timeout_s
         last_status = "unknown"
+        saw_busy = False
         while time.monotonic() < deadline:
             if abort is not None and getattr(abort, "is_set", lambda: False)():
                 return -1
             text, busy = self.get_status()
             last_status = text
-            if not busy:
-                return self.get_position()
+            if busy:
+                saw_busy = True
+            else:
+                if saw_busy:
+                    time.sleep(0.2)
+                for _ in range(4):
+                    text2, busy2 = self.get_status()
+                    last_status = text2
+                    if busy2:
+                        saw_busy = True
+                        break
+                    try:
+                        pos = self.get_position()
+                        if pos == port:
+                            return pos
+                    except SV07Error:
+                        time.sleep(0.1)
+                else:
+                    try:
+                        return self.get_position()
+                    except SV07Error:
+                        pass
             time.sleep(poll_interval_s)
         raise SV07Error(
             f"valve move did not complete within {timeout_s:.1f}s; last status: {last_status}"
