@@ -2274,7 +2274,11 @@ class VacuumPanel(ttk.LabelFrame):
                     conn = self.serial_conn
                     if conn is not None and getattr(conn, "is_open", False):
                         try:
-                            conn.write(b"0")
+                            # Burst-send the OFF command so motor-brush EMI can't
+                            # corrupt the single byte and leave the motor running
+                            # while we believe we have stopped it. Matches
+                            # _send_value / send_vacuum_sync. See _VACUUM_CMD_REPEATS.
+                            conn.write(b"0" * _VACUUM_CMD_REPEATS)
                             conn.flush()
                         except Exception:
                             pass
@@ -5163,7 +5167,13 @@ class PumpControllerApp(tk.Tk):
                     conn = vp.serial_conn
                     if conn is not None and getattr(conn, "is_open", False):
                         try:
-                            conn.write(b"0")
+                            # Burst-send OFF: the vacuum motor is the dominant
+                            # EMI source on this USB-serial link, so an abort
+                            # arriving while it is running is exactly when a
+                            # single-byte command is most likely to be
+                            # corrupted. Match the EMI-resilient burst used by
+                            # the normal command path (_VACUUM_CMD_REPEATS).
+                            conn.write(b"0" * _VACUUM_CMD_REPEATS)
                             conn.flush()
                         except Exception:
                             pass
