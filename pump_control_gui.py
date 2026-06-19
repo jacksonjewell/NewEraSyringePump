@@ -2349,7 +2349,19 @@ class VacuumPanel(ttk.LabelFrame):
                     conn = self.serial_conn
                     if conn is not None and getattr(conn, "is_open", False):
                         try:
-                            conn.write(b"0")
+                            # Send the OFF command as the same EMI-hardened
+                            # burst used by the manual toggle (_send_value)
+                            # and the recipe runner (send_vacuum_sync).
+                            # force_off is the global Power-Off / emergency-
+                            # stop path, invoked while the brushed vacuum
+                            # motor is running — i.e. exactly when EMI on
+                            # the USB-serial line is at its worst. A single
+                            # '0' byte can be flipped by EMI and silently
+                            # ignored by the Arduino (which only acts on
+                            # exact '0' / '1'), which would leave the motor
+                            # energized while the UI shows it as OFF. The
+                            # burst makes that essentially impossible.
+                            conn.write(b"0" * _VACUUM_CMD_REPEATS)
                             conn.flush()
                         except Exception:
                             pass
